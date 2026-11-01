@@ -57,10 +57,19 @@ type peerChannel struct {
 }
 
 // peerRoot is the shared location candidates are built under. /tmp is used
-// deliberately: it is the directory sandbox profiles most often grant because
-// toolchains need scratch space, which makes it the most likely real-world
-// channel rather than a contrived one.
-const peerRoot = "/tmp"
+// deliberately on Unix: it is the directory sandbox profiles most often grant
+// because toolchains need scratch space, which makes it the most likely
+// real-world channel rather than a contrived one. Windows has no /tmp (and no
+// unix-socket channel in the same sense), so the per-user temp dir is used
+// there — the filesystem channels are the ones that must carry everywhere.
+var peerRoot = tempRoot()
+
+func tempRoot() string {
+	if runtime.GOOS == "windows" {
+		return os.TempDir()
+	}
+	return "/tmp"
+}
 
 func peerChannels() []peerChannel {
 	return []peerChannel{

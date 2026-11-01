@@ -31,13 +31,21 @@ func TestAbiCapabilities(t *testing.T) {
 		if !strings.Contains(got, tc.mustContain) {
 			t.Errorf("ABI %d: %q missing %q", tc.abi, got, tc.mustContain)
 		}
-		if tc.mustNotHave != "" && strings.Contains(got, tc.mustNotHave) {
+		// Descriptions note what a level lacks as "(no UDP)"; that is a
+		// negation, not a claim. Only an un-negated mention grants it.
+		if tc.mustNotHave != "" && claimsCapability(got, tc.mustNotHave) {
 			t.Errorf("ABI %d: %q should not claim %q", tc.abi, got, tc.mustNotHave)
 		}
 	}
 	if abiCapabilities(0) != "" {
 		t.Error("ABI 0 means unsupported and must describe nothing")
 	}
+}
+
+// claimsCapability reports whether desc grants cap: the capability is named
+// without an explicit "no <cap>" negation beside it.
+func claimsCapability(desc, cap string) bool {
+	return strings.Contains(desc, cap) && !strings.Contains(desc, "no "+cap)
 }
 
 func TestParseLSM(t *testing.T) {

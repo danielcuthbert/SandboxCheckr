@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -256,8 +257,12 @@ func TestBlockUnblock(t *testing.T) {
 	if !strings.Contains(string(data), "is.gd\n") || !strings.Contains(string(data), "r.jina.ai\n") {
 		t.Errorf("deny file lacks entries:\n%s", data)
 	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
-		t.Errorf("deny file mode %v, want 0600", fi.Mode().Perm())
+	// File modes are a Unix invariant (the kill switch must not be group or
+	// world writable); Windows has no permission bits to assert.
+	if runtime.GOOS != "windows" {
+		if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+			t.Errorf("deny file mode %v, want 0600", fi.Mode().Perm())
+		}
 	}
 	if err := c.Run(ctx, "unblock is.gd"); err != nil {
 		t.Fatal(err)
