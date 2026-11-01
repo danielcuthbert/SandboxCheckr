@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "0"
+      - name: runner end-to-end (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          make build
+          SANDBOXCHECKR_BIN=$PWD/bin/sandboxcheckr go test ./internal/mechanisms/seatbelt/ -run Concurrent -v
+
+  # The bubblewrap mechanism has unit tests everywhere, but only a real Linux
+  # run proves the sandbox can be built and the probe child starts inside it.
+  # This job installs bubblewrap and runs the full report end to end.
+  linux-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04+ restricts unprivileged user namespaces via AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: build
+        run: make build
+      - name: report
+        run: ./bin/sandboxcheckr --no-banner --json | tee report.json
+        continue-on-error: true
+      - name: assert bubblewrap was measured
+        run: |
+          jq -e '.mechanisms[] | select(.id=="bubblewrap-strict") | .probes | length > 0' report.json
+          jq -e '.mechanisms[] | select(.id=="bubblewrap-strict") | .usable' report.json
+          jq -e '.baseline.probes | length > 0' report.json
+      - name: emitted wrapper runs a command
+        run: |
+          mkdir -p /tmp/proj
+          ./bin/sandboxcheckr --emit bubblewrap-strict --workdir /tmp/proj
+          sh bubblewrap-strict.sh /bin/sh -c 'touch /tmp/proj/ok && ! ls "$HOME"/.ssh 2>/dev/null'
+          test -f /tmp/proj/ok
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-report
+          path: report.json
+
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make cross
