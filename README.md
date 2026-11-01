@@ -1,6 +1,6 @@
 # SandboxCheckr
 
-**Run untrusted code without handing it your machine.**
+**Run untrusted code without handing it your machine, or eating your face**
 
 You want to run a coding agent, an MCP server, or some `npm` package's install
 script — but not let it read `~/.ssh`, POST your `~/.aws/credentials` somewhere,
