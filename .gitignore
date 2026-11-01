@@ -1,0 +1,9 @@
+bin/
+.claude/
+__pycache__/
+.DS_Store
+
+# Artifacts written by `sandboxcheckr --emit` when run from the repo root.
+/seatbelt-*.sb
+/seatbelt-*.sh
+/bubblewrap-*.sh
