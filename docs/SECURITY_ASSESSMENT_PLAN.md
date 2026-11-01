@@ -120,9 +120,11 @@ clear even before a full adversarial run:
   `ALLOW_DOTENV`, `ALLOW_EXEC_CONFIG`, `SANDBOXCHECKR`, `PROXY_LOG`, `DENY_FILE`
   and `PORT`. Make policy-changing inputs explicit flags and document the rest
   as advanced, trusted-parent settings (A01).
-- The default proxy text log and Seatbelt scratch are under the writable
-  project. Treat that log as unauthoritative now; move host-side evidence out
-  of the grant, and require separate workdirs for peer isolation (A09/A12).
+- The default proxy text log now lives in a private per-run directory outside
+  the workdir, where the sandboxed program cannot edit it (`run` refuses an
+  inherited `PROXY_LOG` inside the project). The Seatbelt scratch directory is
+  still under the writable project; treat the log as authoritative only where
+  `run` started it, and require separate workdirs for peer isolation (A09/A12).
 - `DenyFile.Match` discards a refresh error. Surface the error to the proxy and
   choose an explicit refusal policy, especially when a deny file that existed
   becomes unreadable (A16).

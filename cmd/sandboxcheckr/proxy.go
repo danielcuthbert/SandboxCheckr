@@ -46,7 +46,8 @@ by hand to discover what a program contacts (--observe), or to enforce an
 allow-list for something you launch yourself with HTTPS_PROXY=http://127.0.0.1:<port>.
 
 WHAT IT CONTROLS
-  hosts      only --allow'ed hosts are reachable (default: api.anthropic.com)
+  hosts      only --allow'ed hosts are reachable (default: api.anthropic.com;
+             --deny-all permits none)
   ports      443 and 80 only, unless --allow-port
   addresses  names resolving to private, loopback or link-local space (incl. cloud
              metadata) are refused; --allow-private-host opens one host, not all
@@ -98,6 +99,17 @@ EXAMPLES
       --ca-bundle-out ./ca.pem
 `
 
+// effectiveAllowPatterns decides the starting allow-list: whatever was given,
+// or the api.anthropic.com default unless the caller denied all hosts. The
+// default exists for a bare `sandboxcheckr proxy`; `run` passes --deny-all for
+// commands with no provider default of their own.
+func effectiveAllowPatterns(given []string, observe, denyAll bool) []string {
+	if len(given) > 0 || observe || denyAll {
+		return given
+	}
+	return defaultAllow
+}
+
 // runProxy serves the allow-listing egress proxy.
 func runProxy(args []string) int {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
@@ -112,6 +124,7 @@ func runProxy(args []string) int {
 	fs.Var(&allows, "allow", "`host` to permit; repeatable. A leading '.' also permits subdomains (.github.com)")
 	fs.Var(&ports, "allow-port", "destination `port` to permit for allowed hosts; repeatable (default 443 and 80)")
 	fs.Var(&privHosts, "allow-private-host", "let this `host` resolve to a private address (an internal registry); repeatable. Link-local/metadata stays refused")
+	denyAll := fs.Bool("deny-all", false, "with no --allow, permit no host at all instead of the api.anthropic.com default")
 	fs.Var(&rules, "rule", "restrict an allowed host: `host:METHODS[:/path,/path]`, e.g. registry.internal:GET,HEAD; repeatable. Ruled hosts are TLS-inspected")
 	port := fs.Int("port", 0, "loopback `port` to bind (0 picks a free one; the address is printed on stdout)")
 	unixSock := fs.String("unix", "", "listen on this unix socket `path` instead of a loopback TCP port")
@@ -142,9 +155,8 @@ func runProxy(args []string) int {
 		return 2
 	}
 
-	patterns := allows
-	if len(patterns) == 0 && !*observe {
-		patterns = defaultAllow
+	patterns := effectiveAllowPatterns(allows, *observe, *denyAll)
+	if len(allows) == 0 && !*observe && !*denyAll {
 		fmt.Fprintf(os.Stderr, "no --allow given; defaulting to %s\n", strings.Join(defaultAllow, ", "))
 	}
 
@@ -269,8 +281,18 @@ func runProxy(args []string) int {
 	if *observe {
 		fmt.Fprintln(os.Stderr,
 			"OBSERVE MODE: every destination is permitted and logged. This is NOT enforcement.")
+	} else if rules := list.Rules(); len(rules) == 0 {
+		fmt.Fprintln(os.Stderr, "enforcing allow-list: nothing (every destination is refused)")
 	} else {
-		fmt.Fprintf(os.Stderr, "enforcing allow-list: %s\n", strings.Join(list.Rules(), ", "))
+		fmt.Fprintf(os.Stderr, "enforcing allow-list: %s\n", strings.Join(rules, ", "))
+	}
+	// The rest of the configured policy, so what was configured and what was
+	// later observed (the exit summary) read as two separate things.
+	if len(ports) > 0 {
+		fmt.Fprintf(os.Stderr, "permitted ports: %s (besides 443 and 80)\n", strings.Join(ports, ", "))
+	}
+	if len(privHosts) > 0 {
+		fmt.Fprintf(os.Stderr, "private-address hosts: %s\n", strings.Join(privHosts, ", "))
 	}
 	for _, r := range rules {
 		fmt.Fprintf(os.Stderr, "request rule: %s (TLS-inspected)\n", r)

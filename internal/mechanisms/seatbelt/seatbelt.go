@@ -650,7 +650,15 @@ func runnerScript(m *Mechanism, profileName string, w mechanism.Workdir) string 
 		} else {
 			fmt.Fprintf(&b, "PORT=\"${PORT:-%d}\"\n", m.proxyPort)
 		}
-		b.WriteString("PROXY_LOG=\"${PROXY_LOG:-$WORKDIR/.sandboxcheckr-tmp/proxy.log}\"\n")
+		// The decision log lives outside the workdir, in a private per-run
+		// directory the sandboxed program can neither see nor edit. It is
+		// kept after the run, like the event log, so decisions stay
+		// inspectable; PROXY_LOG= overrides for a trusted parent.
+		b.WriteString("# The per-run decision log lives outside the workdir, in a private directory:\n" +
+			"# the sandboxed program can neither see nor edit it. PROXY_LOG= overrides.\n" +
+			"if [ -z \"${PROXY_LOG:-}\" ]; then\n" +
+			"  PROXY_LOG=\"$(mktemp -d \"${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX\")/proxy.log\"\n" +
+			"fi\n")
 		// The event log lives outside the workdir, where the sandboxed program
 		// cannot forge or erase it, and is shared by every runner so the
 		// console can compare agents.
@@ -723,7 +731,14 @@ EXEC_RIGHTS="file-read* file-test-existence file-map-executable"
 # Grant the command's install directory and its parent. Launchers installed by
 # npm, nvm or Homebrew are symlinks whose real file sits a level or two inside
 # a package root, and the program loads its own modules from there.
-CMD_PATH=$(command -v "$1" 2>/dev/null) || { echo "command not found: $1" >&2; exit 127; }
+CMD_PATH=$(command -v "$1" 2>/dev/null) || {
+  echo "command not found: $1" >&2
+  echo "  Looked up in this shell's PATH. Fixes:" >&2
+  echo "    - install it, or run it by absolute path: sh $0 /absolute/path/to/$1 ..." >&2
+  echo "    - if it comes from a version manager (nvm, pyenv, mise, ...), source that manager's init script in this shell first" >&2
+  echo "    - check the search path with: echo \$PATH" >&2
+  exit 127
+}
 CMD_REAL=$(realpath_of "$CMD_PATH")
 CMD_DIR=$(dirname "$CMD_REAL")
 PATH_DIRS=$(dirname "$CMD_PATH")
@@ -836,6 +851,9 @@ proxy_start() {
 }
 proxy_start &
 PROXY_PID=$!
+# Recorded for sandboxcheckr run: if this runner is killed before its trap
+# stops the proxy, run stops it so the exit summary is still printed.
+echo "$PROXY_PID" > "$HERE/.proxy-pid" 2>/dev/null || true
 trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; rm -f "$READY"; if [ -n "$CANARY_DIR" ]; then rm -rf "$CANARY_DIR"; fi' EXIT INT TERM
 i=0
 until [ -s "$READY" ]; do
@@ -893,6 +911,9 @@ if [ "${CANARY_KILL:-0}" = 1 ] && [ -n "$CANARY_DIR" ]; then
 else
   "$@" || status=$?
 fi
+# Separate the program's own output from what the egress proxy observed, so
+# the summary that follows reads as the observed side of the run.
+echo >&2 "── observed connection attempts (this run's egress proxy) ──"
 kill "$PROXY_PID" 2>/dev/null || true
 proxy_status=0
 wait "$PROXY_PID" 2>/dev/null || proxy_status=$?
