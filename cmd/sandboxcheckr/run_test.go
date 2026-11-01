@@ -9,9 +9,21 @@ import (
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 )
 
+// foundCommand returns a command every platform can find in PATH — this test
+// binary itself — so validation tests reach the flag checks instead of failing
+// the command lookup first (e.g. /usr/bin/true does not exist on Windows).
+func foundCommand(t *testing.T) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
+
 func TestRunRejectsAllowFlagInjection(t *testing.T) {
 	project := t.TempDir()
-	if got := runSandbox([]string{"--workdir", project, "--allow", "api.example.com --observe", "/usr/bin/true"}); got != 2 {
+	if got := runSandbox([]string{"--workdir", project, "--allow", "api.example.com --observe", foundCommand(t)}); got != 2 {
 		t.Fatalf("exit status = %d, want 2", got)
 	}
 }
@@ -89,7 +101,7 @@ func TestAllowFlagsForDenyByDefault(t *testing.T) {
 func TestRunRejectsInvalidAllowPort(t *testing.T) {
 	project := t.TempDir()
 	for _, port := range []string{"99999", "443;--observe", "http"} {
-		if got := runSandbox([]string{"--workdir", project, "--allow-port", port, "/usr/bin/true"}); got != 2 {
+		if got := runSandbox([]string{"--workdir", project, "--allow-port", port, foundCommand(t)}); got != 2 {
 			t.Fatalf("--allow-port %q: exit status = %d, want 2", port, got)
 		}
 	}
@@ -97,7 +109,7 @@ func TestRunRejectsInvalidAllowPort(t *testing.T) {
 
 func TestRunRejectsInvalidPrivateHost(t *testing.T) {
 	project := t.TempDir()
-	if got := runSandbox([]string{"--workdir", project, "--allow-private-host", "not a host", "/usr/bin/true"}); got != 2 {
+	if got := runSandbox([]string{"--workdir", project, "--allow-private-host", "not a host", foundCommand(t)}); got != 2 {
 		t.Fatalf("exit status = %d, want 2", got)
 	}
 }
@@ -105,7 +117,7 @@ func TestRunRejectsInvalidPrivateHost(t *testing.T) {
 func TestRunRejectsObserveWithPortOrPrivateHost(t *testing.T) {
 	project := t.TempDir()
 	for _, flag := range []string{"--allow-port", "--allow-private-host"} {
-		args := []string{"--workdir", project, "--observe", flag, "8080", "/usr/bin/true"}
+		args := []string{"--workdir", project, "--observe", flag, "8080", foundCommand(t)}
 		if got := runSandbox(args); got != 2 {
 			t.Fatalf("%s with --observe: exit status = %d, want 2", flag, got)
 		}
@@ -117,7 +129,7 @@ func TestRunRejectsObserveWithPortOrPrivateHost(t *testing.T) {
 func TestRunRefusesProxyLogInsideProject(t *testing.T) {
 	project := t.TempDir()
 	t.Setenv("PROXY_LOG", filepath.Join(project, "proxy.log"))
-	if got := runSandbox([]string{"--workdir", project, "/usr/bin/true"}); got != 2 {
+	if got := runSandbox([]string{"--workdir", project, foundCommand(t)}); got != 2 {
 		t.Fatalf("exit status = %d, want 2", got)
 	}
 }
