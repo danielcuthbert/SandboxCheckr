@@ -39,6 +39,15 @@ Examples:
   sandboxcheckr run --allow registry.npmjs.org -- npm install
   sandboxcheckr run --observe -- npm test  # discovers hosts; still blocks canary trips
 
+Claude keeps api.anthropic.com and Codex api.openai.com unless you change it.
+Any other command starts with NO network: the proxy refuses every destination
+until you name one with --allow. A local inference endpoint is private
+address space, which the proxy refuses by default, so name the host, that
+fact, and its port explicitly:
+
+  sandboxcheckr run --allow localhost --allow-private-host localhost \
+      --allow-port 11434 -- my-local-agent
+
 For Claude or Codex, an existing API key is passed if set; otherwise existing
 login files are granted. No other shell credentials are passed unless you name
 them with --pass-env or --rw. --no-agent-auth disables these presets.
@@ -46,14 +55,57 @@ them with --pass-env or --rw. --no-agent-auth disables these presets.
 FLAGS
 `
 
+// allowFlagsFor builds the ALLOW value the runner passes to this run's proxy.
+// Claude and Codex keep their provider's endpoint; every other command gets an
+// explicit deny, because falling through to the proxy's api.anthropic.com
+// default handed `run -- npm install` a working route to a model API nobody
+// had configured. User flags are appended to whatever baseline applies.
+func allowFlagsFor(commandName string, allows, rules, ports, privHosts []string) string {
+	var parts []string
+	switch commandName {
+	case "claude":
+		parts = append(parts, "--allow api.anthropic.com")
+	case "codex":
+		parts = append(parts, "--allow api.openai.com")
+	default:
+		if len(allows) == 0 && len(rules) == 0 {
+			parts = append(parts, "--deny-all")
+		}
+	}
+	for _, host := range allows {
+		parts = append(parts, "--allow "+host)
+	}
+	for _, rule := range rules {
+		parts = append(parts, "--rule "+rule)
+	}
+	for _, port := range ports {
+		parts = append(parts, "--allow-port "+port)
+	}
+	for _, host := range privHosts {
+		parts = append(parts, "--allow-private-host "+host)
+	}
+	return strings.Join(parts, " ")
+}
+
+// pathHelp accompanies a failed command lookup: the command is found exactly
+// as it would be without the sandbox, so the fix is the usual PATH work.
+const pathHelp = `The command is looked up in this shell's PATH, as it would be without the sandbox. To fix:
+  - install it, or run it by absolute path: sandboxcheckr run /path/to/command ...
+  - if it comes from a version manager (nvm, pyenv, mise, ...), source that
+    manager's init script in this shell so PATH is set
+  - check the search path with: echo $PATH
+`
+
 func runSandbox(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(fs.Output(), runUsage); fs.PrintDefaults() }
 	workdir := fs.String("workdir", ".", "project `directory` (default: current directory)")
-	var allows, rules, passes, rw, ro multiFlag
+	var allows, rules, passes, rw, ro, ports, privHosts multiFlag
 	fs.Var(&allows, "allow", "permit this destination `host`; repeatable")
 	fs.Var(&rules, "rule", "restrict an allowed host: `host:METHODS[:/path]`; repeatable")
+	fs.Var(&ports, "allow-port", "destination `port` to permit for allowed hosts; repeatable (default 443 and 80)")
+	fs.Var(&privHosts, "allow-private-host", "let this `host` resolve to a private address (a local inference server, an internal registry); repeatable. Link-local/metadata stays refused")
 	fs.Var(&passes, "pass-env", "pass this named environment variable; repeatable")
 	fs.Var(&rw, "rw", "grant this existing `path` read/write access; repeatable")
 	fs.Var(&ro, "ro", "grant this existing `path` read-only access; repeatable")
@@ -74,9 +126,16 @@ func runSandbox(args []string) int {
 		fs.Usage()
 		return 2
 	}
-	if *observe && (len(allows) > 0 || len(rules) > 0) {
-		fmt.Fprintln(os.Stderr, "--observe cannot be combined with --allow or --rule")
+	if *observe && (len(allows) > 0 || len(rules) > 0 || len(ports) > 0 || len(privHosts) > 0) {
+		fmt.Fprintln(os.Stderr, "--observe cannot be combined with --allow, --rule, --allow-port or --allow-private-host")
 		return 2
+	}
+	// The runner looks the command up in this shell's PATH and would fail
+	// 127 after the proxy had already started. Fail here instead, with the
+	// fix, before anything is built or started.
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "run: cannot find %q: %v\n%s", argv[0], err, pathHelp)
+		return 127
 	}
 	project, err := filepath.Abs(*workdir)
 	if err != nil {
@@ -94,6 +153,15 @@ func runSandbox(args []string) int {
 	if mechanism.TooBroadToGrant(project) {
 		fmt.Fprintln(os.Stderr, "--workdir must name a project directory, not / or your home directory")
 		return 2
+	}
+	// The proxy decision log is evidence about what the program did. Inside
+	// the workdir the sandboxed program could rewrite it, so an inherited
+	// PROXY_LOG pointing there is refused rather than honoured.
+	if inherited := os.Getenv("PROXY_LOG"); inherited != "" {
+		if _, err := resolveOutsideProject("the proxy decision log (PROXY_LOG)", inherited, project); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
 	}
 	for i, host := range allows {
 		if strings.HasPrefix(host, "*.") {
@@ -116,6 +184,23 @@ func runSandbox(args []string) int {
 		}
 		if _, err := proxy.ParseHostRule(rule); err != nil {
 			fmt.Fprintln(os.Stderr, "--rule:", err)
+			return 2
+		}
+	}
+	for _, port := range ports {
+		// Digits only, so the value cannot split into flags when the runner
+		// expands $ALLOW unquoted.
+		if !proxy.ValidPort(port) {
+			fmt.Fprintf(os.Stderr, "--allow-port: invalid port %q\n", port)
+			return 2
+		}
+	}
+	for _, host := range privHosts {
+		if strings.HasPrefix(host, "*.") {
+			host = host[1:]
+		}
+		if !proxy.ValidHostname(strings.TrimPrefix(host, ".")) {
+			fmt.Fprintf(os.Stderr, "--allow-private-host: invalid hostname %q\n", host)
 			return 2
 		}
 	}
@@ -262,20 +347,8 @@ func runSandbox(args []string) int {
 	}
 	if *observe {
 		env = replaceEnv(env, "ALLOW", "--observe")
-	} else if len(allows) > 0 || len(rules) > 0 || commandName == "codex" {
-		var parts []string
-		if commandName == "claude" {
-			parts = append(parts, "--allow api.anthropic.com")
-		} else if commandName == "codex" {
-			parts = append(parts, "--allow api.openai.com")
-		}
-		for _, host := range allows {
-			parts = append(parts, "--allow "+host)
-		}
-		for _, rule := range rules {
-			parts = append(parts, "--rule "+rule)
-		}
-		env = replaceEnv(env, "ALLOW", strings.Join(parts, " "))
+	} else {
+		env = replaceEnv(env, "ALLOW", allowFlagsFor(commandName, allows, rules, ports, privHosts))
 	}
 
 	cmd := exec.Command("/bin/sh", append([]string{filepath.Join(private, art.FileName)}, argv...)...)
@@ -298,6 +371,9 @@ func runSandbox(args []string) int {
 	}()
 	err = cmd.Wait()
 	close(done)
+	// If the runner died before its trap stopped the proxy, stop it here so
+	// the exit summary is printed after the child exits on every path.
+	stopOrphanedProxy(private)
 	if err == nil {
 		return 0
 	}
@@ -377,32 +453,36 @@ func safeProxyWord(s string) bool {
 	return true
 }
 
-func eventLogForRun(explicit, project string) (string, error) {
+// resolveOutsideProject resolves path to an absolute form with symlinked
+// directories resolved, and refuses anything inside the project directory:
+// logs the sandboxed program can reach, it can rewrite.
+func resolveOutsideProject(label, path, project string) (string, error) {
 	if real, err := filepath.EvalSymlinks(project); err == nil {
 		project = real
 	}
-	inside := func(path string) bool {
-		return path == project || strings.HasPrefix(path, project+string(filepath.Separator))
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
 	}
+	for dir := filepath.Dir(p); ; dir = filepath.Dir(dir) {
+		if parent, err := filepath.EvalSymlinks(dir); err == nil {
+			rel, _ := filepath.Rel(dir, p)
+			p = filepath.Join(parent, rel)
+			break
+		}
+		if dir == filepath.Dir(dir) {
+			break
+		}
+	}
+	if p == project || strings.HasPrefix(p, project+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s must be outside the project so the sandboxed program cannot edit it", label)
+	}
+	return p, nil
+}
+
+func eventLogForRun(explicit, project string) (string, error) {
 	resolve := func(path string) (string, error) {
-		p, err := filepath.Abs(path)
-		if err != nil {
-			return "", err
-		}
-		for dir := filepath.Dir(p); ; dir = filepath.Dir(dir) {
-			if parent, err := filepath.EvalSymlinks(dir); err == nil {
-				rel, _ := filepath.Rel(dir, p)
-				p = filepath.Join(parent, rel)
-				break
-			}
-			if dir == filepath.Dir(dir) {
-				break
-			}
-		}
-		if inside(p) {
-			return "", fmt.Errorf("event log must be outside the project so the sandbox cannot edit it")
-		}
-		return p, nil
+		return resolveOutsideProject("event log", path, project)
 	}
 	if explicit != "" {
 		return resolve(explicit)

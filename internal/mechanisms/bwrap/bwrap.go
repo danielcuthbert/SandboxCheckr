@@ -414,7 +414,16 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 		// Per-run socket name: two runners in the same workdir must not share
 		// (or delete) each other's proxy.
 		b.WriteString("SOCK=\"$WORKDIR/.scr-proxy.$$.sock\"\n")
-		b.WriteString("PROXY_LOG=\"${PROXY_LOG:-$WORKDIR/.sandboxcheckr-proxy.log}\"\n")
+		b.WriteString("HERE=$(cd \"$(dirname \"$0\")\" && pwd)\n")
+		// The decision log lives outside the workdir, in a private per-run
+		// directory the sandboxed program can neither see nor edit. It is
+		// kept after the run, like the event log, so decisions stay
+		// inspectable; PROXY_LOG= overrides for a trusted parent.
+		b.WriteString("# The per-run decision log lives outside the workdir, in a private directory:\n" +
+			"# the sandboxed program can neither see nor edit it. PROXY_LOG= overrides.\n" +
+			"if [ -z \"${PROXY_LOG:-}\" ]; then\n" +
+			"  PROXY_LOG=\"$(mktemp -d \"${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX\")/proxy.log\"\n" +
+			"fi\n")
 		// The event log lives outside the workdir, where the sandboxed program
 		// cannot forge or erase it, and is shared by every runner so the
 		// console can compare agents.
@@ -426,7 +435,14 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 	}
 	b.WriteString(`
 [ $# -ge 1 ] || { echo "usage: sh $0 <command> [args...]" >&2; exit 2; }
-CMD_PATH=$(command -v "$1" 2>/dev/null) || { echo "command not found: $1" >&2; exit 127; }
+CMD_PATH=$(command -v "$1" 2>/dev/null) || {
+  echo "command not found: $1" >&2
+  echo "  Looked up in this shell's PATH. Fixes:" >&2
+  echo "    - install it, or run it by absolute path: sh $0 /absolute/path/to/$1 ..." >&2
+  echo "    - if it comes from a version manager (nvm, pyenv, mise, ...), source that manager's init script in this shell first" >&2
+  echo "    - check the search path with: echo \$PATH" >&2
+  exit 127
+}
 CMD_REAL=$(realpath "$CMD_PATH")
 BWRAP_PATH=$(command -v bwrap 2>/dev/null) || { echo "bwrap not found" >&2; exit 127; }
 shift
@@ -437,7 +453,7 @@ shift
 # sandbox sees at the same path, and wait until it is listening.
 READY="$SOCK.ready"
 rm -f "$SOCK" "$READY" "$CA_BUNDLE"
-mkdir -p "$(dirname "$EVENTS")"
+mkdir -p "$(dirname "$PROXY_LOG")" "$(dirname "$EVENTS")"
 AGENT="${AGENT:-$(basename "$CMD_PATH")-$$}"
 CANARY_DIR=""
 CANARY_FLAGS=""
@@ -467,6 +483,9 @@ proxy_start() {
 }
 proxy_start &
 PROXY_PID=$!
+# Recorded for sandboxcheckr run: if this runner is killed before its trap
+# stops the proxy, run stops it so the exit summary is still printed.
+echo "$PROXY_PID" > "$HERE/.proxy-pid" 2>/dev/null || true
 trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; rm -f "$SOCK" "$READY" "$CA_BUNDLE"; if [ -n "$CANARY_DIR" ]; then rm -rf "$CANARY_DIR"; fi' EXIT INT TERM
 i=0
 until [ -s "$READY" ]; do
@@ -574,6 +593,9 @@ if [ "${CANARY_KILL:-0}" = 1 ] && [ -n "$CANARY_DIR" ]; then
 else
   run_confined "$@" || status=$?
 fi
+# Separate the program's own output from what the egress proxy observed, so
+# the summary that follows reads as the observed side of the run.
+echo >&2 "── observed connection attempts (this run's egress proxy) ──"
 kill "$PROXY_PID" 2>/dev/null || true
 proxy_status=0
 wait "$PROXY_PID" 2>/dev/null || proxy_status=$?

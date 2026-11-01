@@ -7,3 +7,6 @@ __pycache__/
 /seatbelt-*.sb
 /seatbelt-*.sh
 /bubblewrap-*.sh
+
+# Decision logs from runs before the log moved to a private per-run directory.
+/.sandboxcheckr-proxy.log

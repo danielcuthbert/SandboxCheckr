@@ -339,8 +339,9 @@ ENVIRONMENT (read by emitted runner scripts)
              See: sandboxcheckr help proxy
   PORT       fix the runner's proxy port (default: a free port each run, so sandboxes
              started together never share a proxy)
-  PROXY_LOG  where the runner's proxy writes its decisions (default: inside the workdir's
-             .sandboxcheckr-tmp/; the summary is printed when the program exits)
+  PROXY_LOG  where the runner's proxy writes its decisions (default: a private per-run
+             directory outside the workdir, which the sandboxed program cannot edit;
+             the summary is printed when the program exits)
   CANARY=0  disable canaries in an emitted proxied runner (run: --no-canary)
   CANARY_KILL=1  stop its sandbox process on a high-confidence trip (run: --canary-kill)
 
@@ -381,7 +382,9 @@ func writeMechanismHelp(out io.Writer) {
 // "sandboxcheckr help proxy", and a test checks both mention every flag.
 const proxyHelpSummary = `
 EGRESS PROXY (used by sandboxcheckr run and the *-proxy mechanisms)
-  With "run", use --allow, --rule or --observe. Emitted runners use ALLOW=.
+  With "run", use --allow, --rule, --allow-port, --allow-private-host or
+  --observe; other commands get no destinations at all unless you allow them.
+  Emitted runners use ALLOW=.
   Each run gets its own proxy on a free port. Direct sockets and DNS are denied in
   the sandbox, so the proxy is the only way out. What it controls:
     hosts      only allowed hosts (Claude default api.anthropic.com) --allow host, --allow .domain

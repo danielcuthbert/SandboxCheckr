@@ -160,7 +160,7 @@ program that ignores the proxy gets no network at all.
 
 | | Default | Change with |
 |---|---|---|
-| Hosts | `api.anthropic.com` for Claude; `api.openai.com` for Codex; the proxy alone defaults to `api.anthropic.com` | `run --allow host` (`.github.com` = domain and subdomains) |
+| Hosts | `api.anthropic.com` for Claude; `api.openai.com` for Codex; any other command starts with **none** — `run` passes `--deny-all`, so every destination is refused until you name one | `run --allow host` (`.github.com` = domain and subdomains) |
 | Ports | 443 and 80 | `--allow-port N` (applies to every allowed host) |
 | Private addresses | refused, incl. cloud metadata — checked on every resolved IP | `--allow-private-host host` for one internal host; link-local stays refused |
 | What you can do on a host | anything | `--rule host:METHODS[:/path,…]` — e.g. `registry.corp:GET,HEAD` |
@@ -179,6 +179,11 @@ sandboxcheckr run --observe claude
 # Add only the hosts you approve. A rule can limit methods and paths.
 sandboxcheckr run --allow .github.com --allow registry.npmjs.org \
   --rule registry.npmjs.org:GET,HEAD -- claude
+
+# A local inference server sits on private address space, which is refused by
+# default — name the host, that fact, and its port explicitly.
+sandboxcheckr run --allow localhost --allow-private-host localhost \
+  --allow-port 11434 -- my-local-agent
 ```
 
 `sandboxcheckr --emit seatbelt-proxy --workdir ~/code/app` remains available
@@ -188,8 +193,11 @@ its allow-list through `ALLOW="--allow ..."` instead of `run` flags.
 Every run gets **its own proxy on a free port** (Linux: its own socket), so
 sandboxes started side by side never share an allow-list or a log. (`PORT=9000`
 fixes the port if you need to; `sandboxcheckr proxy --port N` does the same when
-running the proxy by hand.) Decisions go to `.sandboxcheckr-tmp/proxy.log` in the
-workdir (`PROXY_LOG=` to move it) and a summary is printed when the program exits:
+running the proxy by hand.) Decisions go to a per-run log in a private
+temporary directory **outside** the workdir, where the sandboxed program can
+neither see nor edit it (`PROXY_LOG=` to choose the file); the summary is
+printed when the program exits, under its own *observed connection attempts*
+heading, after everything the program itself printed:
 
 ```
 Destinations contacted:

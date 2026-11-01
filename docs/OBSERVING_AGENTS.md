@@ -160,7 +160,7 @@ condition.
 | `--pass-env NAME` | `PASS_ENV=NAME` | Environment variable let into the sandbox |
 | `--ro PATH`, `--rw PATH` | `EXTRA_RO`, `EXTRA_RW` | Extra paths it may read, or read and write |
 | `--no-canary`, `--canary-kill` | `CANARY=0`, `CANARY_KILL=1` | Disable canaries, or stop on a high-confidence trip |
-| — | `PROXY_LOG` | Text decision log (default inside the workdir) |
+| — | `PROXY_LOG` | Text decision log (default: a private per-run directory outside the workdir) |
 | — | `DENY_FILE` | Kill switch, re-read live (default `~/.config/sandboxcheckr/deny.txt`) |
 | — | `SANDBOXCHECKR` | Path to the binary, if it has moved since the runner was emitted |
 

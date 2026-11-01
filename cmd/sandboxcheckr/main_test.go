@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -147,6 +148,25 @@ func TestMainHelpSummarisesProxyControls(t *testing.T) {
 		if !strings.Contains(proxyHelpSummary, name) {
 			t.Errorf("main help's proxy summary does not mention %s", name)
 		}
+	}
+}
+
+// --deny-all must suppress the api.anthropic.com default, so `run` can start a
+// generic command with no reachable host at all.
+func TestDenyAllSuppressesDefaultAllow(t *testing.T) {
+	if got := effectiveAllowPatterns(nil, false, false); !slices.Equal(got, defaultAllow) {
+		t.Errorf("bare proxy default = %v, want %v", got, defaultAllow)
+	}
+	for _, c := range []struct{ observe, denyAll bool }{
+		{observe: false, denyAll: true},
+		{observe: true, denyAll: false},
+	} {
+		if got := effectiveAllowPatterns(nil, c.observe, c.denyAll); len(got) != 0 {
+			t.Errorf("observe=%v denyAll=%v: patterns = %v, want none", c.observe, c.denyAll, got)
+		}
+	}
+	if got := effectiveAllowPatterns([]string{"a.example"}, false, true); !slices.Equal(got, []string{"a.example"}) {
+		t.Errorf("explicit list = %v, want it kept", got)
 	}
 }
 

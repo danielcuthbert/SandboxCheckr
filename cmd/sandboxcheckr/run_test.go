@@ -58,3 +58,82 @@ func TestRunProxyWordsCannotSplitIntoFlags(t *testing.T) {
 		t.Fatal("run help lacks one-command example")
 	}
 }
+
+// Generic commands previously fell through to the proxy's api.anthropic.com
+// default; they must start with nothing reachable. Claude and Codex keep their
+// provider endpoints.
+func TestAllowFlagsForDenyByDefault(t *testing.T) {
+	cases := []struct {
+		name             string
+		command          string
+		allows, rules    []string
+		ports, privHosts []string
+		want             string
+	}{
+		{"generic denies all", "sh", nil, nil, nil, nil, "--deny-all"},
+		{"claude keeps provider", "claude", nil, nil, nil, nil, "--allow api.anthropic.com"},
+		{"codex keeps provider", "codex", nil, nil, nil, nil, "--allow api.openai.com"},
+		{"generic with allow", "sh", []string{"registry.example"}, nil, nil, nil, "--allow registry.example"},
+		{"generic with rule only", "sh", nil, []string{"registry.example:GET,HEAD"}, nil, nil, "--rule registry.example:GET,HEAD"},
+		{"claude with extras", "claude", []string{".github.com"}, nil, nil, nil, "--allow api.anthropic.com --allow .github.com"},
+		{"local inference endpoint", "sh", []string{"localhost"}, nil, []string{"11434"}, []string{"localhost"},
+			"--allow localhost --allow-port 11434 --allow-private-host localhost"},
+	}
+	for _, c := range cases {
+		if got := allowFlagsFor(c.command, c.allows, c.rules, c.ports, c.privHosts); got != c.want {
+			t.Errorf("%s: allowFlagsFor = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRunRejectsInvalidAllowPort(t *testing.T) {
+	project := t.TempDir()
+	for _, port := range []string{"99999", "443;--observe", "http"} {
+		if got := runSandbox([]string{"--workdir", project, "--allow-port", port, "/usr/bin/true"}); got != 2 {
+			t.Fatalf("--allow-port %q: exit status = %d, want 2", port, got)
+		}
+	}
+}
+
+func TestRunRejectsInvalidPrivateHost(t *testing.T) {
+	project := t.TempDir()
+	if got := runSandbox([]string{"--workdir", project, "--allow-private-host", "not a host", "/usr/bin/true"}); got != 2 {
+		t.Fatalf("exit status = %d, want 2", got)
+	}
+}
+
+func TestRunRejectsObserveWithPortOrPrivateHost(t *testing.T) {
+	project := t.TempDir()
+	for _, flag := range []string{"--allow-port", "--allow-private-host"} {
+		args := []string{"--workdir", project, "--observe", flag, "8080", "/usr/bin/true"}
+		if got := runSandbox(args); got != 2 {
+			t.Fatalf("%s with --observe: exit status = %d, want 2", flag, got)
+		}
+	}
+}
+
+// A proxy decision log inside the project is editable by the sandboxed
+// program, so an inherited PROXY_LOG pointing there must be refused.
+func TestRunRefusesProxyLogInsideProject(t *testing.T) {
+	project := t.TempDir()
+	t.Setenv("PROXY_LOG", filepath.Join(project, "proxy.log"))
+	if got := runSandbox([]string{"--workdir", project, "/usr/bin/true"}); got != 2 {
+		t.Fatalf("exit status = %d, want 2", got)
+	}
+}
+
+// The command lookup must fail before the proxy starts, with exit status 127.
+func TestRunCommandNotFoundFailsFast(t *testing.T) {
+	project := t.TempDir()
+	if got := runSandbox([]string{"--workdir", project, "definitely-not-installed-xyz"}); got != 127 {
+		t.Fatalf("exit status = %d, want 127", got)
+	}
+}
+
+func TestPathHelpExplainsFix(t *testing.T) {
+	for _, want := range []string{"PATH", "absolute path", "version manager"} {
+		if !strings.Contains(pathHelp, want) {
+			t.Errorf("path help lacks %q", want)
+		}
+	}
+}

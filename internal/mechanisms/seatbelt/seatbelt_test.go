@@ -15,7 +15,7 @@ import (
 )
 
 func TestProxiedWrapperShellSyntax(t *testing.T) {
-	art, err := NewProxied(0, true).Wrapper(mechanism.Workdir{Path: "/tmp/canary project"})
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/canary project"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,6 +23,31 @@ func TestProxiedWrapperShellSyntax(t *testing.T) {
 	cmd.Stdin = strings.NewReader(art.FileBody)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generated runner is not valid sh: %v\n%s", err, out)
+	}
+}
+
+// The decision log is evidence about what the program did, so it must default
+// to a private per-run directory outside the workdir — the sandboxed program
+// can neither see nor edit it there. The runner also records the proxy PID for
+// `run` to stop an orphaned proxy, and separates the program's output from the
+// proxy's observed-connections summary.
+func TestProxiedRunnerKeepsDecisionLogOutsideWorkdir(t *testing.T) {
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(art.FileBody, "PROXY_LOG=\"${PROXY_LOG:-$WORKDIR") {
+		t.Errorf("default decision log must not live in the workdir:\n%s", art.FileBody)
+	}
+	for _, want := range []string{
+		`mktemp -d "${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX"`,
+		`echo "$PROXY_PID" > "$HERE/.proxy-pid"`,
+		"observed connection attempts",
+		"Looked up in this shell's PATH",
+	} {
+		if !strings.Contains(art.FileBody, want) {
+			t.Errorf("proxied runner lacks %q", want)
+		}
 	}
 }
 
