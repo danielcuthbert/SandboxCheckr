@@ -5,19 +5,12 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
-
-// armRunnerPdeathsig makes the runner shell die with this process. Without it
-// a SIGKILLed run leaves the runner, the proxy and the sandbox orphaned.
-func armRunnerPdeathsig(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-}
 
 // stopOrphanedProxy terminates this run's egress proxy if the runner died
 // before its trap could stop it — killed outright, say, rather than exiting
