@@ -150,6 +150,9 @@ func runProxy(args []string) int {
 		}
 		return 2
 	}
+	// Die with the runner shell even if `run` was SIGKILLed and never got to
+	// clean up (see pdeathsig_linux.go).
+	armSelfPdeathsig()
 	if *canaryKill && (*canaryPath == "" || *canaryPID == "") {
 		fmt.Fprintln(os.Stderr, "--canary-kill requires --canaries and --canary-pid-file")
 		return 2
@@ -280,7 +283,7 @@ func runProxy(args []string) int {
 
 	if *observe {
 		fmt.Fprintln(os.Stderr,
-			"OBSERVE MODE: every destination is permitted and logged. This is NOT enforcement.")
+			"OBSERVE MODE: disallowed destinations are permitted and logged. The port gate, private-address refusals and canary trips still enforce. This is NOT full enforcement.")
 	} else if rules := list.Rules(); len(rules) == 0 {
 		fmt.Fprintln(os.Stderr, "enforcing allow-list: nothing (every destination is refused)")
 	} else {

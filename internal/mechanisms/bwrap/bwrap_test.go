@@ -91,7 +91,7 @@ func TestProxiedRunnerKeepsDecisionLogOutsideWorkdir(t *testing.T) {
 		t.Errorf("default decision log must not live in the workdir:\n%s", art.FileBody)
 	}
 	for _, want := range []string{
-		`mktemp -d "${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX"`,
+		`LOGDIR=$(mktemp -d /tmp/sandboxcheckr-log.XXXXXX)`,
 		`echo "$PROXY_PID" > "$HERE/.proxy-pid"`,
 		"observed connection attempts",
 		"Looked up in this shell's PATH",

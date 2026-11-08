@@ -45,7 +45,7 @@ func TestDenyFileMatching(t *testing.T) {
 }
 
 // A missing file is an empty list; creating, editing and deleting it take
-// effect on the next lookup.
+// effect after Refresh (the watcher reloads once a second).
 func TestDenyFileReloads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "deny.txt")
 	d, err := NewDenyFile(path)
@@ -56,20 +56,29 @@ func TestDenyFileReloads(t *testing.T) {
 		t.Fatal("missing file must refuse nothing")
 	}
 	_ = os.WriteFile(path, []byte("a.test\n"), 0o600)
+	if changed, err := d.Refresh(); err != nil || !changed {
+		t.Fatalf("Refresh must report the new file (changed=%v err=%v)", changed, err)
+	}
 	if _, hit := d.Match("a.test"); !hit {
-		t.Error("new entry must apply on the next lookup")
+		t.Error("new entry must apply after Refresh")
 	}
 	// Same size, so only the mtime differs: push it forward to be sure the
 	// change is seen on filesystems with coarse timestamps.
 	_ = os.WriteFile(path, []byte("b.test\n"), 0o600)
 	future := time.Now().Add(2 * time.Second)
 	_ = os.Chtimes(path, future, future)
+	if changed, err := d.Refresh(); err != nil || !changed {
+		t.Fatalf("Refresh must report the mtime change (changed=%v err=%v)", changed, err)
+	}
 	if _, hit := d.Match("a.test"); hit {
-		t.Error("removed entry must stop applying")
+		t.Error("removed entry must stop applying after Refresh")
 	}
 	_ = os.Remove(path)
+	if changed, err := d.Refresh(); err != nil || !changed {
+		t.Fatalf("Refresh must report the deletion (changed=%v err=%v)", changed, err)
+	}
 	if _, hit := d.Match("b.test"); hit {
-		t.Error("deleting the file must clear the list")
+		t.Error("deleting the file must clear the list after Refresh")
 	}
 }
 

@@ -258,8 +258,10 @@ A refusal there is not noise: it is the program looking for a way out or a
 place to leave a message.
 
 **Kill switch.** The allow-list is set when a run starts. To cut a host off
-*during* a run, add it to `~/.config/sandboxcheckr/deny.txt` (`DENY_FILE=` to
-move it), or type `block <host>` in the console. Every running proxy re-reads
+*during* a run, add it to `~/.config/sandboxcheckr/deny.txt` (or pass
+`--deny-file <file>` to `run` to use a different file — the inherited
+`DENY_FILE` variable is ignored), or type `block <host>` in the console. Every
+running proxy re-reads
 the file, refuses the host and its subdomains from the next connection, and
 within a second closes connections to it that are already open, since an
 agent sends everything over the connection it already holds. The file can
