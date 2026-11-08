@@ -112,6 +112,7 @@ func runSandbox(args []string) int {
 	observe := fs.Bool("observe", false, "permit and log ordinary destinations; canary trips stay blocked")
 	eventsPath := fs.String("events", "", "shared event log `file` outside the project")
 	agent := fs.String("agent", "", "agent label in the event log")
+	denyFile := fs.String("deny-file", "", "live kill-switch `file`: hosts listed here are cut off mid-run")
 	canaryKill := fs.Bool("canary-kill", false, "stop the command on a high-confidence canary trip")
 	noCanary := fs.Bool("no-canary", false, "disable canary credentials (the proxy prints this)")
 	noAgentAuth := fs.Bool("no-agent-auth", false, "do not grant known agents their existing login credentials")
@@ -266,7 +267,9 @@ func runSandbox(args []string) int {
 		fmt.Fprintln(os.Stderr, "generating runner:", err)
 		return 1
 	}
-	private, err := os.MkdirTemp("", "sandboxcheckr-run-*")
+	// Absolute template: an inherited TMPDIR must not move the runner (which
+	// knows the policy) somewhere the sandboxed program can read.
+	private, err := os.MkdirTemp("/tmp", "sandboxcheckr-run-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "creating private runner:", err)
 		return 1
@@ -278,9 +281,13 @@ func runSandbox(args []string) int {
 	}
 
 	env := os.Environ()
-	// This command takes its configuration from flags. An unrelated exported
-	// PASS_ENV, EXTRA_RW or ALLOW must not silently widen the new sandbox.
-	for _, name := range []string{"PASS_ENV", "EXTRA_RW", "EXTRA_RO", "ALLOW", "CANARY", "CANARY_KILL"} {
+	// This command takes its configuration from flags. Inherited policy
+	// switches must not silently widen (or subvert) the new sandbox:
+	// SANDBOXCHECKR would choose which binary the runner execs, AGENT forges
+	// the event-log label, DENY_FILE/ALLOW_* change the policy, TMPDIR would
+	// move private runner state somewhere the child can see.
+	for _, name := range []string{"PASS_ENV", "EXTRA_RW", "EXTRA_RO", "ALLOW", "CANARY", "CANARY_KILL",
+		"SANDBOXCHECKR", "AGENT", "DENY_FILE", "ALLOW_DOTENV", "ALLOW_EXEC_CONFIG", "TMPDIR"} {
 		env = replaceEnv(env, name, "")
 	}
 	passNames := []string(passes)
@@ -339,6 +346,9 @@ func runSandbox(args []string) int {
 	if *agent != "" {
 		env = replaceEnv(env, "AGENT", *agent)
 	}
+	if *denyFile != "" {
+		env = replaceEnv(env, "DENY_FILE", *denyFile)
+	}
 	if *canaryKill {
 		env = replaceEnv(env, "CANARY_KILL", "1")
 	}
@@ -354,6 +364,11 @@ func runSandbox(args []string) int {
 	cmd := exec.Command("/bin/sh", append([]string{filepath.Join(private, art.FileName)}, argv...)...)
 	cmd.Dir, cmd.Env = project, env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// If run is killed outright (SIGKILL skips every deferred cleanup, so
+	// stopOrphanedProxy would never fire), take the runner shell with it; the
+	// proxy arms its own PDEATHSIG against that shell, so the whole chain —
+	// run, runner, proxy, sandbox — dies together.
+	armRunnerPdeathsig(cmd)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "starting runner:", err)
 		return 1

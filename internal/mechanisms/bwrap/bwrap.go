@@ -348,6 +348,9 @@ func (m *Mechanism) env(home, scratch string) []string {
 	if m.proxyPort != 0 {
 		extra = mechanism.ProxyEnv(fmt.Sprintf("http://127.0.0.1:%d", m.proxyPort))
 	}
+	// This mechanism replaces /tmp with a private per-sandbox tmpfs, so probes
+	// running inside must not report a shared-scratch peer channel.
+	extra = append(extra, "SANDBOXCHECKR_PRIVATE_TMP=1")
 	return mechanism.SandboxEnv(home, scratch, extra)
 }
 
@@ -410,10 +413,16 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 	if m.proxyPort != 0 {
 		b.WriteString("ALLOW=\"${ALLOW:---allow api.anthropic.com}\"\n")
 		fmt.Fprintf(&b, "SANDBOXCHECKR_DEFAULT=%s\n", selfPath())
-		b.WriteString("SANDBOXCHECKR=\"${SANDBOXCHECKR:-$SANDBOXCHECKR_DEFAULT}\"\n")
-		// Per-run socket name: two runners in the same workdir must not share
-		// (or delete) each other's proxy.
-		b.WriteString("SOCK=\"$WORKDIR/.scr-proxy.$$.sock\"\n")
+		// The binary is pinned, not env-overridable: an inherited
+		// SANDBOXCHECKR would run attacker code outside the sandbox.
+		b.WriteString("SANDBOXCHECKR=\"$SANDBOXCHECKR_DEFAULT\"\n")
+		// Private per-run directory for the proxy socket and CA bundle. It is
+		// outside the workdir, so a peer agent sharing the workdir can neither
+		// see the socket path nor hijack it, and the sandboxed program cannot
+		// tamper with the CA bundle (bound read-only). Removed at exit.
+		b.WriteString("PRIVDIR=$(mktemp -d /tmp/sandboxcheckr-run.XXXXXX)\n")
+		b.WriteString("SOCK=\"$PRIVDIR/proxy.sock\"\n")
+		b.WriteString("PRIV_IN=\"/tmp/.sandboxcheckr-run\"\n")
 		b.WriteString("HERE=$(cd \"$(dirname \"$0\")\" && pwd)\n")
 		// The decision log lives outside the workdir, in a private per-run
 		// directory the sandboxed program can neither see nor edit. It is
@@ -422,7 +431,8 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 		b.WriteString("# The per-run decision log lives outside the workdir, in a private directory:\n" +
 			"# the sandboxed program can neither see nor edit it. PROXY_LOG= overrides.\n" +
 			"if [ -z \"${PROXY_LOG:-}\" ]; then\n" +
-			"  PROXY_LOG=\"$(mktemp -d \"${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX\")/proxy.log\"\n" +
+			"  LOGDIR=$(mktemp -d /tmp/sandboxcheckr-log.XXXXXX)\n" +
+			"  PROXY_LOG=\"$LOGDIR/proxy.log\"\n" +
 			"fi\n")
 		// The event log lives outside the workdir, where the sandboxed program
 		// cannot forge or erase it, and is shared by every runner so the
@@ -431,7 +441,7 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 		// Shared by every runner, outside the workdir: the agent must not be
 		// able to edit its own kill switch.
 		b.WriteString("DENY_FILE=\"${DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/sandboxcheckr/deny.txt}\"\n")
-		b.WriteString("CA_BUNDLE=\"$WORKDIR/.sandboxcheckr-ca.$$.pem\"\n")
+		b.WriteString("CA_BUNDLE=\"$PRIVDIR/ca.pem\"\n")
 	}
 	b.WriteString(`
 [ $# -ge 1 ] || { echo "usage: sh $0 <command> [args...]" >&2; exit 2; }
@@ -486,7 +496,7 @@ PROXY_PID=$!
 # Recorded for sandboxcheckr run: if this runner is killed before its trap
 # stops the proxy, run stops it so the exit summary is still printed.
 echo "$PROXY_PID" > "$HERE/.proxy-pid" 2>/dev/null || true
-trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; rm -f "$SOCK" "$READY" "$CA_BUNDLE"; if [ -n "$CANARY_DIR" ]; then rm -rf "$CANARY_DIR"; fi' EXIT INT TERM
+trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; rm -rf "$PRIVDIR"; if [ -n "$CANARY_DIR" ]; then rm -rf "$CANARY_DIR"; fi' EXIT INT TERM
 i=0
 until [ -s "$READY" ]; do
   i=$((i + 1))
@@ -495,6 +505,7 @@ until [ -s "$READY" ]; do
   fi
   sleep 0.1
 done
+echo "sandboxcheckr: running $CMD_REAL (selected from host PATH as $CMD_PATH)" >&2
 echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, events to $EVENTS as $AGENT" >&2
 `)
 	}
@@ -514,7 +525,7 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 	// finally the fixed arguments that were probed.
 	b.WriteString("\n# The command (and, for the proxied variant, the in-sandbox bridge).\n")
 	if m.proxyPort != 0 {
-		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$SOCK\" -- \"$CMD_PATH\" \"$@\"\n",
+		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$PRIV_IN/proxy.sock\" -- \"$CMD_PATH\" \"$@\"\n",
 			BridgeSubcommand, m.proxyPort)
 	} else {
 		b.WriteString("set -- -- \"$CMD_PATH\" \"$@\"\n")
@@ -524,6 +535,20 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 	// The protections go in before EXTRA_RW and the program binds, so in the
 	// final argv they follow every writable bind and win over it.
 	b.WriteString(runnerProtect)
+	// The tool's own binary, when it lives inside the workdir (repo-as-workdir),
+	// is pinned read-only: a sandboxed program must not be able to replace what
+	// the user will execute next.
+	fmt.Fprintf(&b, "case %s in \"$WORKDIR\"/*) set -- --ro-bind %s %s \"$@\" ;; esac\n",
+		shQuote(selfPath()), shQuote(selfPath()), shQuote(selfPath()))
+	if m.proxyPort != 0 {
+		// The private per-run dir (proxy socket, CA bundle) is visible inside
+		// only through this read-only bind at a fixed path; the host path never
+		// appears in the child's view and a peer sharing the workdir cannot
+		// find it to hijack. Emitted after the command lookup so it cannot
+		// clobber the child argv, and only for proxied runs (PRIVDIR exists
+		// there alone).
+		b.WriteString("set -- --ro-bind \"$PRIVDIR\" \"$PRIV_IN\" \"$@\"\n")
+	}
 	b.WriteString("\n# Program directories, bound read-only AFTER the tmpfs over /home so they are not hidden.\n")
 	b.WriteString("for d in \"$(dirname \"$CMD_PATH\")\" \"$(dirname \"$CMD_REAL\")\" \"$(dirname \"$(dirname \"$CMD_REAL\")\")\"; do\n")
 	b.WriteString("  r=$(resolve \"$d\")\n")
@@ -554,7 +579,7 @@ fi
 		b.WriteString("# --rule hosts are TLS-inspected; trust this run's constrained CA inside the sandbox only.\n")
 		b.WriteString("if [ -s \"$CA_BUNDLE\" ]; then\n")
 		b.WriteString("  for v in SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO PIP_CERT; do\n")
-		b.WriteString("    set -- --setenv \"$v\" \"$CA_BUNDLE\" \"$@\"\n  done\nfi\n")
+		b.WriteString("    set -- --setenv \"$v\" \"$PRIV_IN/ca.pem\" \"$@\"\n  done\nfi\n")
 	}
 	b.WriteString("\n")
 
@@ -651,8 +676,11 @@ if [ "${ALLOW_DOTENV:-0}" = 1 ]; then
 else
   IFS=$NL
   for f in $(find "$WORKDIR" \( -name node_modules -o -name .venv -o -name vendor -o -name target \) -prune \
-      -o -type f \( -name .env -o -name '.env.*' \) -print 2>/dev/null); do
-    if [ -n "${CANARY_DIR:-}" ] && [ -f "$CANARY_DATA/dotenv" ]; then
+      -o \( -name .env -o -name '.env.*' \) -print 2>/dev/null); do
+    if [ -d "$f" ]; then
+      # A directory named .env (or .env.*) must be hidden too, not just files.
+      set -- --tmpfs "$f" "$@"
+    elif [ -n "${CANARY_DIR:-}" ] && [ -f "$CANARY_DATA/dotenv" ]; then
       set -- --ro-bind "$CANARY_DATA/dotenv" "$f" "$@"
     else
       set -- --ro-bind /dev/null "$f" "$@"

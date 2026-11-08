@@ -156,8 +156,9 @@ finding is empirically confirmed or analysis-derived pending a run.
 - **Mitigation:** add `--unshare-user-try` and `--cap-drop ALL`; correct the
   comment to name the real protection (userns + `no_new_privs`).
 - **Status:** FIX APPLIED 2026-09-22 (`--unshare-user-try`, `--cap-drop ALL`,
-  comment corrected in `bwrap.go`). Pending verification on a Linux host — the
-  code compiles but has never run there.
+  comment corrected in `bwrap.go`). **Verified on Linux 2026-11-08** — both
+  flags present in the emitted art (BT-7.4a/b). The root-invocation case
+  remains unverified (sudo needs a password; BT-7.4c UNV).
 
 ### SBX-004 — bubblewrap "practical" shares the host network namespace · MEDIUM
 
@@ -261,8 +262,12 @@ finding is empirically confirmed or analysis-derived pending a run.
     `.github` themselves stops rename-edit-rename-back. The runner re-applies
     these blocks after `EXTRA_RO`/`EXTRA_RW` (Seatbelt takes the last match,
     so a later grant would otherwise undo them). bubblewrap mounts
-    `/dev/null` over each `.env` and re-binds the exec-config paths read-only.
-    Opt out per class: `ALLOW_DOTENV=1`, `ALLOW_EXEC_CONFIG=1`.
+    `/dev/null` over each `.env` file and overlays `.env.*` **directories** with
+    an empty tmpfs (a directory named `.env.d` used to slip through — F8),
+    and re-binds the exec-config paths read-only.
+    Opt out per class: `ALLOW_DOTENV=1`, `ALLOW_EXEC_CONFIG=1` — honored by the
+    mechanism and emitted runners; `run` clears inherited values so the sandbox
+    cannot widen itself through them.
   - **Probes:** `fs.read.workdir_secrets` (reads back a decoy `.env`; an empty
     read counts as blocked, which is what bubblewrap's mount produces) and
     `fs.write.deferred_exec` (creates a hook and an editor task, opens git config
@@ -313,6 +318,12 @@ finding is empirically confirmed or analysis-derived pending a run.
 - **Also found during the fix:** the runner quoted the binary path inside
   `${SANDBOXCHECKR:-'…'}`, where single quotes are literal, so the proxy never
   started. Fixed; covered by an end-to-end runner test.
+- **Superseded 2026-11-08 (F4/F5):** the per-run socket moved out of the shared
+  workdir entirely — bound in a private `mktemp -d /tmp/sandboxcheckr-run.XXXXXX`
+  dir (0700) and ro-bound into the sandbox at `/tmp/.sandboxcheckr-run`. Peer
+  reuse (BT-2.21) and hijack (BT-2.20) are closed; the socket dir's 0700 keeps
+  other host UIDs out, while a same-UID host process remains a documented
+  residual (F6 / BT-2.22).
 
 ---
 

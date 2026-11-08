@@ -243,6 +243,19 @@ func emitWrapper(id, workdir string, proxyPort int) int {
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = resolved
 	}
+	// The emitted runner is trusted code (it carries the bwrap arguments). If
+	// it lands inside the sandboxed workdir, the sandboxed program can rewrite
+	// it (e.g. swap --tmpfs /home for --bind) and the next invocation runs the
+	// tampered wrapper.
+	if cwd, err := os.Getwd(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+			cwd = resolved
+		}
+		if cwd == abs || strings.HasPrefix(cwd, abs+string(filepath.Separator)) {
+			fmt.Fprintf(os.Stderr, "--emit refuses to write the runner inside the sandboxed workdir (%s): a sandboxed program could edit it; run --emit from a directory outside the workdir\n", abs)
+			return 1
+		}
+	}
 
 	var known []string
 	for _, m := range mechanisms.All(proxyPort) {

@@ -201,6 +201,15 @@ func hasAnySuffix(s string, suffixes []string) bool {
 func probeSharedScratch() model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilSharedScratch, Want: model.VerdictBlocked}
 
+	// The mechanism told us /tmp is a private per-sandbox tmpfs: writable, but
+	// two sandboxes cannot see each other's files there, so there is no peer
+	// channel. Report that instead of a false alarm from writability alone.
+	if os.Getenv("SANDBOXCHECKR_PRIVATE_TMP") == "1" {
+		r.Verdict = model.VerdictBlocked
+		r.Detail = "/tmp is a private per-sandbox tmpfs: writable, but not shared between sandboxes"
+		return r
+	}
+
 	var writable []string
 	for _, dir := range sharedScratchDirs {
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {

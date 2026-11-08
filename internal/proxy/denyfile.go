@@ -122,7 +122,9 @@ func (d *DenyFile) Match(host string) (string, bool) {
 	if d == nil {
 		return "", false
 	}
-	_, _ = d.Refresh()
+	// No Refresh here: the watcher goroutine is the sole reloader, so every
+	// reload is logged exactly once (a decision-path refresh would consume the
+	// mtime change and starve the watcher's "DENYFILE reloaded" line).
 	return d.match(host)
 }
 
