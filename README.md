@@ -184,6 +184,16 @@ sandboxcheckr run --allow .github.com --allow registry.npmjs.org \
 # default — name the host, that fact, and its port explicitly.
 sandboxcheckr run --allow localhost --allow-private-host localhost \
   --allow-port 11434 -- my-local-agent
+
+# Real example, omp against a local vLLM on port 8000. The agent connects by
+# IP literal, and the proxy treats "localhost" and "127.0.0.1" as different
+# destinations, so allow both. Tools that keep state in your home (session
+# history, caches) need that directory granted, or they start blank; read-only
+# would break session resume.
+sandboxcheckr run --agent omp \
+  --allow localhost --allow 127.0.0.1 \
+  --allow-private-host localhost --allow-private-host 127.0.0.1 \
+  --allow-port 8000 --rw ~/.omp -- omp -c
 ```
 
 `sandboxcheckr --emit seatbelt-proxy --workdir ~/code/app` remains available
@@ -283,10 +293,14 @@ log (`~/.local/state/sandboxcheckr/events.jsonl`; `EVENTS=` to move it), labelle
 with the run's agent name (`AGENT=`, default `<command>-<pid>`). The log lives
 outside the workdir, so the sandboxed program cannot forge or erase it.
 `sandboxcheckr console` queries it — interactively, or one command at a time.
-Opened with no command, it starts with a **state of the nation**: every agent
-ranked by the worst thing it did (`CANARY TRIPPED`, `UPLOADING`, `RELAY REACHED`, `PROBING`,
-`SENT DATA`, `quiet`), relay activity by kind of service, and a short list of
-what to look at, each with the console command that shows it:
+Opened with no command, it starts with a **state of the nation**: what the
+refusals were (kill switch, allow-list, private address, metadata, canary
+use, ports), an activity strip with connections and refusals per bucket on
+the same scale (a refusal spike against a quiet connect line is probing),
+every agent ranked by the worst thing it did (`CANARY TRIPPED`, `UPLOADING`,
+`RELAY REACHED`, `PROBING`, `SENT DATA`, `quiet`), the top destinations by
+traffic and the most-refused hosts, relay activity by kind of service, and a
+short list of what to look at, each with the console command that shows it:
 
 ```
 $ sandboxcheckr console agents

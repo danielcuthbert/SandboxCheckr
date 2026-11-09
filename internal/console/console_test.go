@@ -282,3 +282,101 @@ func TestBlockUnblock(t *testing.T) {
 		t.Errorf("blocked: %v\n%s", err, out.String())
 	}
 }
+
+func TestRefusalClasses(t *testing.T) {
+	cases := map[string]string{
+		"in deny file (localhost)":                "kill switch (deny file)",
+		"resolved to non-public address 127.0.0.1; refusing (use --allow-private-host localhost to permit this host only)": "private address",
+		"resolved to non-public address 169.254.169.254; refusing (use --allow-private-host 169.254.169.254 to permit this host only)": "cloud metadata endpoint",
+		"not in allow-list":                                    "not on the allow-list",
+		"port not permitted; use --allow-port":                 "port not permitted",
+		"rule github.com:GET,HEAD:/x/: method PUT not permitted (allowed: GET,HEAD)": "outside its --rule (method)",
+		"rule github.com:GET,HEAD:/x/: path contains traversal or encoded separators": "outside its --rule (path)",
+		"canary credential":                                    "canary credential use",
+	}
+	for in, want := range cases {
+		if got := refusalClass(in); got != want {
+			t.Errorf("refusalClass(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestTimelineBuckets(t *testing.T) {
+	evs := []events.Event{
+		ev(0, "a", events.KindConnect, events.Allow, "h1", "", false),
+		ev(30*60, "a", events.KindConnect, events.Deny, "h2", "", false), // 30 min later
+	}
+	s := Summarise(evs)
+	// A 30-minute window gets minute buckets.
+	if s.BucketWidth != time.Minute || len(s.Timeline) != 31 {
+		t.Fatalf("width %s, %d buckets; want 1m and 31", s.BucketWidth, len(s.Timeline))
+	}
+	if s.Timeline[0].Conns != 1 || s.Timeline[30].Conns != 1 || s.Timeline[30].Denied != 1 {
+		t.Errorf("bucket contents wrong: %+v", s.Timeline[30])
+	}
+	if s.Timeline[15].Conns != 0 {
+		t.Errorf("empty bucket should stay empty: %+v", s.Timeline[15])
+	}
+	// An eight-day window coalesces to fit one line.
+	long := []events.Event{ev(0, "a", events.KindConnect, events.Allow, "h", "", false),
+		ev(8*24*3600, "a", events.KindConnect, events.Allow, "h", "", false)}
+	s = Summarise(long)
+	if len(s.Timeline) > 76 {
+		t.Errorf("%d buckets do not fit a line", len(s.Timeline))
+	}
+	if len(s.Timeline) != int(s.Last.Sub(s.Timeline[0].Start)/s.BucketWidth)+1 {
+		t.Errorf("timeline does not cover the window")
+	}
+}
+
+func TestTopHosts(t *testing.T) {
+	evs := append(sample(),
+		events.Event{Time: t0.Add(7 * time.Second), Agent: "a2", Kind: events.KindClose, Host: "api.anthropic.com", Sent: 5000},
+		events.Event{Time: t0.Add(8 * time.Second), Agent: "a2", Kind: events.KindClose, Host: "quiet.example", Sent: 9000},
+	)
+	s := Summarise(evs)
+	if len(s.TopHosts) == 0 || s.TopHosts[0].Host != "quiet.example" || s.TopHosts[0].Sent != 9000 {
+		t.Errorf("top host by sent: %+v", s.TopHosts)
+	}
+	// The refused shortener must surface as most-refused despite no bytes.
+	found := false
+	for _, h := range s.TopDenied {
+		if h.Host == "is.gd" && h.Denied == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("is.gd missing from most-refused: %+v", s.TopDenied)
+	}
+}
+
+func TestHighCanaryCountsAgents(t *testing.T) {
+	evs := []events.Event{
+		{Time: t0, Agent: "a1", Kind: events.KindCanary, Decision: events.Deny, Host: "x.invalid", Canary: "generic-api", Confidence: "high"},
+		{Time: t0.Add(time.Second), Agent: "a1", Kind: events.KindCanary, Decision: events.Deny, Host: "y.invalid", Canary: "generic-api", Confidence: "high"},
+	}
+	if s := Summarise(evs); s.HighCanaries != 1 {
+		t.Errorf("HighCanaries %d, want 1 (one agent, two trips)", s.HighCanaries)
+	}
+}
+
+func TestSummaryShowsNewSections(t *testing.T) {
+	// A window long enough to bucket: ACTIVITY is skipped for single-bucket
+	// windows, where a strip would say nothing.
+	evs := append(sample(),
+		events.Event{Time: t0.Add(30 * time.Minute), Agent: "a3", Kind: events.KindConnect, Decision: events.Deny,
+			Host: "169.254.169.254", Port: "443",
+			Reason: "resolved to non-public address 169.254.169.254; refusing"},
+	)
+	var out bytes.Buffer
+	c := &Console{Out: Printer{W: &out}}
+	c.SetEvents(evs)
+	if err := c.Run(context.Background(), "summary"); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{"ACTIVITY", "conns", "refused", "TOP DESTINATIONS", "buckets of", "cloud metadata endpoint"} {
+		if !strings.Contains(out.String(), w) {
+			t.Errorf("summary lacks %q", w)
+		}
+	}
+}
