@@ -99,43 +99,55 @@ func TestHelpListsEveryMechanism(t *testing.T) {
 	}
 }
 
-// Every top-level flag must be documented in the README command reference, so
-// the two cannot drift apart again.
-func TestReadmeDocumentsEveryFlag(t *testing.T) {
-	readme, err := os.ReadFile("../../README.md")
-	if err != nil {
-		t.Skip("README not found")
+// docText returns the usage documentation: README and user guide together,
+// since the usage content moved to docs/USER_GUIDE.md and either place may
+// carry a flag.
+func docText(t *testing.T) string {
+	t.Helper()
+	var sb strings.Builder
+	for _, p := range []string{"../../README.md", "../../docs/USER_GUIDE.md"} {
+		if b, err := os.ReadFile(p); err == nil {
+			sb.Write(b)
+			sb.WriteByte('\n')
+		}
 	}
+	if sb.Len() == 0 {
+		t.Skip("no README or user guide found")
+	}
+	return sb.String()
+}
+
+// Every top-level flag must be documented in the usage docs (README or the
+// user guide), so the two cannot drift apart again.
+func TestReadmeDocumentsEveryFlag(t *testing.T) {
+	readme := docText(t)
 	for _, name := range []string{"json", "gaps", "no-probes", "peers", "no-color", "no-banner", "ascii",
 		"width", "verbose", "emit", "proxy-port", "workdir", "no-baseline", "tcc"} {
-		if !strings.Contains(string(readme), "--"+name) {
-			t.Errorf("README command reference does not mention --%s", name)
+		if !strings.Contains(readme, "--"+name) {
+			t.Errorf("command reference does not mention --%s", name)
 		}
 	}
 	for _, m := range []string{"seatbelt-strict", "seatbelt-proxy", "seatbelt-network",
 		"bubblewrap-strict", "bubblewrap-proxy", "bubblewrap-network"} {
-		if !strings.Contains(string(readme), m) {
-			t.Errorf("README does not mention mechanism %s", m)
+		if !strings.Contains(readme, m) {
+			t.Errorf("does not mention mechanism %s", m)
 		}
 	}
 }
 
-// Every proxy flag must appear in the README, for the same reason as the
+// Every proxy flag must appear in the usage docs, for the same reason as the
 // top-level flags: so the docs cannot drift from the binary.
 func TestReadmeDocumentsProxyFlags(t *testing.T) {
-	readme, err := os.ReadFile("../../README.md")
-	if err != nil {
-		t.Skip("README not found")
-	}
+	readme := docText(t)
 	for _, name := range []string{"allow", "allow-port", "allow-private-host", "rule", "observe",
 		"ca-bundle-out", "log", "unix", "ready-file", "quiet", "allow-private", "port"} {
-		if !strings.Contains(string(readme), "--"+name) {
-			t.Errorf("README does not mention proxy flag --%s", name)
+		if !strings.Contains(readme, "--"+name) {
+			t.Errorf("does not mention proxy flag --%s", name)
 		}
 	}
 	for _, env := range []string{"PASS_ENV", "EXTRA_RO", "EXTRA_RW", "ALLOW", "PORT", "PROXY_LOG"} {
-		if !strings.Contains(string(readme), env) {
-			t.Errorf("README does not mention runner variable %s", env)
+		if !strings.Contains(readme, env) {
+			t.Errorf("does not mention runner variable %s", env)
 		}
 	}
 }
