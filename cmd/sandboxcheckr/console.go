@@ -33,9 +33,11 @@ With a command, it runs it and exits, so it can be scripted:
   sandboxcheckr console tail relay
   sandboxcheckr console block is.gd     # kill switch: cut a host off in every running proxy
 
-"sandboxcheckr run" and emitted *-proxy runners append to the default log,
-labelling each run with an agent name (default <command>-<pid>). Use run's
---events and --agent flags to choose another log or name.
+"sandboxcheckr run" appends to the current project's own log (under
+~/.local/state/sandboxcheckr/projects/), so agents in different projects do
+not interleave; "sandboxcheckr console" in the same directory reads that log
+back. Emitted *-proxy runners append to the shared default log. Use --events
+on either to choose another file, and --agent to choose the name.
 
 `
 
@@ -48,13 +50,30 @@ func defaultDenyPath() string {
 	return filepath.Join(home, ".config", "sandboxcheckr", "deny.txt")
 }
 
-// defaultEventsPath matches the runners' EVENTS default.
+// defaultEventsPath matches the runners' EVENTS default (used by standalone
+// proxies and as the console's fallback).
 func defaultEventsPath() string {
 	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
 		return filepath.Join(d, "sandboxcheckr", "events.jsonl")
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "state", "sandboxcheckr", "events.jsonl")
+}
+
+// consoleEventsPath resolves the log console reads when --events is not
+// given: the current directory's project log when it exists, otherwise the
+// shared default. run writes to the project log of its --workdir, so running
+// the console in that project reads that project's history back.
+func consoleEventsPath() string {
+	if wd, err := os.Getwd(); err == nil {
+		if project, err := filepath.EvalSymlinks(wd); err == nil {
+			p := projectEventsPath(project)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return defaultEventsPath()
 }
 
 func runConsole(args []string) int {
@@ -66,7 +85,7 @@ func runConsole(args []string) int {
 		fmt.Fprint(fs.Output(), "\nFLAGS\n")
 		fs.PrintDefaults()
 	}
-	path := fs.String("events", defaultEventsPath(), "event log `file` to read")
+	path := fs.String("events", "", "event log `file` to read (default: this project's log, else the shared log)")
 	noColor := fs.Bool("no-color", false, "force ANSI colour off")
 	denyPath := fs.String("deny-file", defaultDenyPath(), "kill-switch `file` that block / unblock edit")
 	if err := fs.Parse(args); err != nil {
@@ -74,6 +93,9 @@ func runConsole(args []string) int {
 			return 0
 		}
 		return 2
+	}
+	if *path == "" {
+		*path = consoleEventsPath()
 	}
 
 	isTTY := tty.IsTerminal(os.Stdout)

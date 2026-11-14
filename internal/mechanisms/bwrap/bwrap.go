@@ -402,6 +402,8 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 	b.WriteString("#   ALLOW_EXEC_CONFIG=1  let it write git hooks/config, CI workflows, editor tasks\n")
 	if m.proxyPort != 0 {
 		b.WriteString("#   ALLOW     proxy allow-list flags (default: --allow api.anthropic.com)\n")
+		b.WriteString("#   BIND_PORTS  ports to bind on the sandbox loopback so direct connections\n")
+		b.WriteString("#               reach the proxy too, e.g. 8000 (default: none)\n")
 		b.WriteString("#   AGENT     label for this run in the event log (default: <command>-<pid>)\n")
 		b.WriteString("#   EVENTS    event log for sandboxcheckr console (default: ~/.local/state/sandboxcheckr/events.jsonl)\n")
 		b.WriteString("#   DENY_FILE hosts to cut off live, even if allowed (default: ~/.config/sandboxcheckr/deny.txt)\n")
@@ -412,6 +414,7 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 	b.WriteString("PASS_ENV=\"${PASS_ENV:-}\"\nEXTRA_RO=\"${EXTRA_RO:-}\"\nEXTRA_RW=\"${EXTRA_RW:-}\"\n")
 	if m.proxyPort != 0 {
 		b.WriteString("ALLOW=\"${ALLOW:---allow api.anthropic.com}\"\n")
+		b.WriteString("BIND_PORTS=\"${BIND_PORTS:-}\"\n")
 		fmt.Fprintf(&b, "SANDBOXCHECKR_DEFAULT=%s\n", selfPath())
 		// The binary is pinned, not env-overridable: an inherited
 		// SANDBOXCHECKR would run attacker code outside the sandbox.
@@ -525,7 +528,7 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 	// finally the fixed arguments that were probed.
 	b.WriteString("\n# The command (and, for the proxied variant, the in-sandbox bridge).\n")
 	if m.proxyPort != 0 {
-		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$PRIV_IN/proxy.sock\" -- \"$CMD_PATH\" \"$@\"\n",
+		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$PRIV_IN/proxy.sock\" ${BIND_PORTS:+--bind-ports \"$BIND_PORTS\"} -- \"$CMD_PATH\" \"$@\"\n",
 			BridgeSubcommand, m.proxyPort)
 	} else {
 		b.WriteString("set -- -- \"$CMD_PATH\" \"$@\"\n")
@@ -552,6 +555,12 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 	b.WriteString("\n# Program directories, bound read-only AFTER the tmpfs over /home so they are not hidden.\n")
 	b.WriteString("for d in \"$(dirname \"$CMD_PATH\")\" \"$(dirname \"$CMD_REAL\")\" \"$(dirname \"$(dirname \"$CMD_REAL\")\")\"; do\n")
 	b.WriteString("  r=$(resolve \"$d\")\n")
+	b.WriteString("  # The workdir is already bound with the user's policy: a program directory\n")
+	b.WriteString("  # at or inside it needs no bind of its own, and one above it would shadow\n")
+	b.WriteString("  # the writable grants inside the workdir (bwrap keeps the last bind of a\n")
+	b.WriteString("  # path), so skip both and leave the workdir's own grants standing.\n")
+	b.WriteString("  case \"$r\" in \"$WORKDIR\"|\"$WORKDIR\"/*) continue ;; esac\n")
+	b.WriteString("  case \"$WORKDIR\" in \"$r\"|\"$r\"/*) continue ;; esac\n")
 	b.WriteString("  if too_broad \"$r\"; then echo \"sandboxcheckr: not binding $d (too broad)\" >&2; continue; fi\n")
 	b.WriteString("  set -- --ro-bind-try \"$d\" \"$d\" \"$@\"\ndone\n")
 	if m.proxyPort != 0 {

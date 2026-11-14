@@ -38,12 +38,49 @@ To see which hosts a command needs, then allow only the ones you choose:
 
 ```sh
 sandboxcheckr run --observe -- npm test
-sandboxcheckr run --allow registry.npmjs.org -- npm test
+sandboxcheckr adopt --write                 # what it saw, as sandboxcheckr.toml
+sandboxcheckr run -- npm test
 ```
+
+`run --observe` permits and logs every destination. `adopt` reads that log
+and prints the missing `allow`, `allow-port` and `allow-private-host` lines
+for your review; `--write` puts them in `sandboxcheckr.toml`. It never
+proposes canary hosts, and a denied enforcing run feeds it just as well.
 
 Observe mode permits ordinary destinations while logging them. It still blocks
 canary trips. You can narrow an allowed HTTP host to methods and paths with
 `--rule`; see the [user guide](docs/USER_GUIDE.md#the-egress-proxy-seatbelt-proxy-bubblewrap-proxy).
+
+Once you know what a command needs, write the policy down in the project
+instead of retyping flags. A `sandboxcheckr.toml` in the project directory is
+the baseline for every `run` in it; command-line flags add to its lists and
+override its switches:
+
+```toml
+# sandboxcheckr.toml
+allow = ["localhost", "127.0.0.1"]
+allow-private-host = ["localhost", "127.0.0.1"]
+allow-port = [8000]
+ro = ["~/tools/raptor"]
+rw = ["~/.omp"]
+```
+
+```sh
+sandboxcheckr run -- omp -c        # the policy file supplies the rest
+```
+
+Python virtualenvs are picked up automatically: an activated `VIRTUAL_ENV`,
+or `.venv`/`venv` in the project, is granted read-only and put first on `PATH`
+inside the sandbox, so the interpreter and its packages resolve without a
+shell wrapper. Event logs are per project by default; `sandboxcheckr console`
+run in the same project reads that project's log back.
+
+On Linux, ports in `allow-port` are also bound on the sandbox's own loopback,
+so tools that bypass HTTP proxies for localhost (some set `NO_PROXY` to cover
+local model servers) still traverse the egress proxy and its policy. A program
+that itself serves on a permitted port will find it taken; drop that port from
+`allow-port` if so — the sandbox's network is private, so nothing outside
+could reach that server anyway.
 
 On macOS, start SandboxCheckr from a normal terminal. If the terminal is already
 inside another sandbox, Seatbelt may be unable to start a second one. On Linux,

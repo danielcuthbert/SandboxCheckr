@@ -336,6 +336,9 @@ func (s *Server) event(e events.Event) {
 	e.Relay = RelayKind(e.Host)
 	e.Fetcher = RelaysOnGet(e.Host)
 	e.ModelAPI = IsModelAPI(e.Host)
+	if e.RunID == "" && s.Canaries != nil {
+		e.RunID = s.Canaries.RunID
+	}
 	s.Events.Write(e)
 }
 

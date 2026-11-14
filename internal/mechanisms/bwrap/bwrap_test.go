@@ -68,6 +68,53 @@ func TestWrapperIsValidShell(t *testing.T) {
 	}
 }
 
+// Permitted ports must reach the in-sandbox bridge through the BIND_PORTS
+// variable: the runner sets it, the bridge binds each port on the sandbox's
+// loopback and tunnels direct connections through the proxy. Without a bridge
+// there is nothing to bind, so the other variants must not mention it.
+func TestProxiedRunnerBindsPermittedPorts(t *testing.T) {
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`BIND_PORTS="${BIND_PORTS:-}"`,
+		`${BIND_PORTS:+--bind-ports "$BIND_PORTS"}`,
+	} {
+		if !strings.Contains(art.FileBody, want) {
+			t.Errorf("proxied runner lacks %q", want)
+		}
+	}
+	for _, m := range []*Mechanism{NewStrict(), NewPractical()} {
+		art, err := m.Wrapper(mechanism.Workdir{Path: "/tmp/proj"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(art.FileBody, "BIND_PORTS") {
+			t.Errorf("%s runner mentions BIND_PORTS without a bridge", m.ID())
+		}
+	}
+}
+
+// A program directory that overlaps the workdir must not be re-bound: the
+// workdir's own grants (a writable out/, state dirs) would be shadowed by a
+// later read-only bind of the same tree, which is what made running a binary
+// that lives in the project (./bin/raptor) crash with a read-only out/.
+func TestProgramDirsNeverRebindTheWorkdir(t *testing.T) {
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`case "$r" in "$WORKDIR"|"$WORKDIR"/*) continue ;; esac`,
+		`case "$WORKDIR" in "$r"|"$r"/*) continue ;; esac`,
+	} {
+		if !strings.Contains(art.FileBody, want) {
+			t.Errorf("program-dir loop lacks the workdir guard %q", want)
+		}
+	}
+}
+
 func indexPair(args []string, flag, val string) int {
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == flag && args[i+1] == val {

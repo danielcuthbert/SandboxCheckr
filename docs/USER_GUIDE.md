@@ -176,6 +176,9 @@ sandboxcheckr run claude
 # Discover hosts when the default allow-list is too narrow.
 sandboxcheckr run --observe claude
 
+# Turn what the run saw into the project's policy file, review it, lock down.
+sandboxcheckr adopt --write
+
 # Add only the hosts you approve. A rule can limit methods and paths.
 sandboxcheckr run --allow .github.com --allow registry.npmjs.org \
   --rule registry.npmjs.org:GET,HEAD -- claude
@@ -195,6 +198,42 @@ sandboxcheckr run --agent omp \
   --allow-private-host localhost --allow-private-host 127.0.0.1 \
   --allow-port 8000 --rw ~/.omp -- omp -c
 ```
+
+That whole invocation is also the contents of a policy file. Put it in
+`~/code/app/sandboxcheckr.toml` and every later run in that project is the
+same command with no flags:
+
+```toml
+# ~/code/app/sandboxcheckr.toml
+agent = "omp"
+allow = ["localhost", "127.0.0.1"]
+allow-private-host = ["localhost", "127.0.0.1"]
+allow-port = [8000]
+rw = ["~/.omp"]
+```
+
+```sh
+sandboxcheckr run -- omp -c
+```
+
+The file accepts `allow`, `rule`, `allow-port`, `allow-private-host`,
+`pass-env`, `ro`, `rw`, `events`, `agent`, `deny-file`, and the switches
+`observe`, `no-canary`, `canary-kill`, `no-agent-auth` — one `key = value`
+per line, strings in quotes, lists in square brackets, `#` comments. It is a
+strict subset of TOML on purpose: an unknown key, a misspelt name or a wrong
+type is an error naming the line, never a silent default. List flags add to
+the file's lists; a scalar flag you pass overrides the file's value. Commit
+the file with the project and the policy is reviewable like any other code.
+
+Permitted ports get one extra leg. Inside the sandbox the loopback is private,
+and a tool that bypasses HTTP proxies for localhost — some set `NO_PROXY` to
+cover local model servers — would find nothing there. On Linux the runner
+therefore binds every `allow-port` port on the sandbox's loopback and tunnels
+those direct connections through the proxy, so the allow-list, the port gate
+and the event log apply to them exactly as to proxied traffic. A program that
+itself serves on a permitted port will find it taken: the bridge binds first.
+Drop such a port from `allow-port` if that matters — nothing outside the
+sandbox could reach that server anyway.
 
 `sandboxcheckr --emit seatbelt-proxy --workdir ~/code/app` remains available
 when you want to inspect or customize a persistent runner. That runner takes
@@ -288,10 +327,16 @@ anonymous writes, no WebDAV, upstreams pinned, per-agent read-only tokens.
 
 ### The console: where each agent went
 
-Every proxied run also appends one JSON line per decision to a shared event
-log (`~/.local/state/sandboxcheckr/events.jsonl`; `EVENTS=` to move it), labelled
-with the run's agent name (`AGENT=`, default `<command>-<pid>`). The log lives
-outside the workdir, so the sandboxed program cannot forge or erase it.
+Every proxied run also appends one JSON line per decision to an event log,
+labelled with the run's agent name (`AGENT=`, default `<command>-<pid>`). By
+default each project gets its own log, at
+`~/.local/state/sandboxcheckr/projects/<hash-of-project>/events.jsonl`, so
+agents in different projects never interleave; `sandboxcheckr console` run in
+the project reads that project's log back. `run --events <file>` (or
+`EVENTS=` for emitted runners) chooses an explicit file instead — the old
+shared log at `~/.local/state/sandboxcheckr/events.jsonl` keeps working that
+way. The log lives outside the workdir, so the sandboxed program cannot forge
+or erase it.
 `sandboxcheckr console` queries it — interactively, or one command at a time.
 Opened with no command, it starts with a **state of the nation**: what the
 refusals were (kill switch, allow-list, private address, metadata, canary
@@ -541,6 +586,12 @@ sandboxcheckr run claude                 # one command, current project, proxied
 sandboxcheckr run --workdir /path/to/project claude
 sandboxcheckr run --allow registry.npmjs.org -- npm install
 sandboxcheckr run --observe claude       # discover hosts; canary trips stay blocked
+# A sandboxcheckr.toml in the project is the baseline; flags add to or override it.
+# Python venvs (VIRTUAL_ENV, .venv, venv) are granted read-only and put first on PATH.
+# Event logs are per project; console in the same project reads that project's log.
+
+sandboxcheckr adopt                       # propose sandboxcheckr.toml lines from the project's event log
+sandboxcheckr adopt --write               # write or regenerate the file (never proposes canary hosts)
 sandboxcheckr run --pass-env API_KEY --rw /path/to/config -- my-agent
 sandboxcheckr run --events /outside/project/events.jsonl --agent agent-a claude
 sandboxcheckr run --rule registry.npmjs.org:GET,HEAD --allow registry.npmjs.org claude

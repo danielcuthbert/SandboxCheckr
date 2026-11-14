@@ -47,6 +47,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "console" {
 		os.Exit(runConsole(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "adopt" {
+		os.Exit(runAdopt(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "lint" {
 		os.Exit(runLint(os.Args[2:]))
 	}
@@ -314,6 +317,7 @@ USAGE
   sandboxcheckr proxy [flags]                        run the allow-listing egress proxy
   sandboxcheckr canary new|env [flags]               create/read a per-run canary set (used by runners)
   sandboxcheckr console [command]                    query the proxy event log: where each agent went
+  sandboxcheckr adopt [--write]                      turn an observe or denied run's log into sandboxcheckr.toml
   sandboxcheckr lint <profile.sb>                    statically audit a Seatbelt profile
   sandboxcheckr version
   sandboxcheckr help [run|proxy|console|lint|canary] this help, or help for a subcommand
@@ -329,6 +333,7 @@ EXAMPLES
   sandboxcheckr                                           full report
   sandboxcheckr run claude                                run Claude in the current project
   sandboxcheckr run --observe claude                      discover hosts before enforcing an allow-list
+  sandboxcheckr adopt --write                             then turn what it saw into sandboxcheckr.toml
   sandboxcheckr run --allow registry.npmjs.org -- npm install
   sandboxcheckr --tcc                                     also check Desktop/Documents/Downloads (macOS)
   sandboxcheckr run --canary-kill claude                  stop on a high-confidence trip

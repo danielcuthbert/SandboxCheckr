@@ -64,9 +64,9 @@ type Bucket struct {
 
 // HostStat is one destination, totals across agents.
 type HostStat struct {
-	Host            string
-	Conns, Denied   int
-	Sent            int64
+	Host          string
+	Conns, Denied int
+	Sent          int64
 }
 
 // ReasonCount counts refusals by what caused them.
@@ -120,9 +120,9 @@ func bucketWidth(span time.Duration) time.Duration {
 	}
 }
 
-// refusalClass reduces a refusal reason to a comparable class. The proxy's
+// RefusalClass reduces a refusal reason to a comparable class. The proxy's
 // reasons carry fixes and addresses; the summary wants the category.
-func refusalClass(reason string) string {
+func RefusalClass(reason string) string {
 	switch {
 	case strings.HasPrefix(reason, "in deny file"):
 		return "kill switch (deny file)"
@@ -255,11 +255,11 @@ func Summarise(evs []events.Event) Summary {
 				h.Denied++
 			}
 			if refused && e.Reason != "" {
-				reasons[refusalClass(e.Reason)]++
+				reasons[RefusalClass(e.Reason)]++
 			}
 		case events.KindRequest:
 			if refused && e.Reason != "" {
-				reasons[refusalClass(e.Reason)]++
+				reasons[RefusalClass(e.Reason)]++
 			}
 		case events.KindClose:
 			h.Sent += e.Sent

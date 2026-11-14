@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
+	"github.com/danielcuthbert/sandboxcheckr/internal/projconfig"
 	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
 )
 
@@ -25,13 +29,15 @@ const runUsage = `sandboxcheckr run — run a command in this project's proxied 
 USAGE
   sandboxcheckr run [flags] <command> [args...]
 
-The current directory is the project by default. A private temporary runner is
-created and removed automatically. Canary credentials and the egress proxy are
-on by default. Canaries use unique .invalid hosts and fake tokens in private
-scratch, never your project or real home. Any trip is denied, logged, printed
-at exit, and returns status 3. --observe still denies canary trips. --canary-kill
-stops the command on a high-confidence trip; --no-canary disables planting.
-No trip does not prove the run was clean: unruled HTTPS hides token strings.
+The current directory is the project by default. If the project contains a
+sandboxcheckr.toml policy file, it is the baseline: command-line flags are
+added to it (list flags) or override it (scalar flags). Canary credentials
+and the egress proxy are on by default. Canaries use unique .invalid hosts
+and fake tokens in private scratch, never your project or real home. Any trip
+is denied, logged, printed at exit, and returns status 3. --observe still
+denies canary trips. --canary-kill stops the command on a high-confidence
+trip; --no-canary disables planting. No trip does not prove the run was
+clean: unruled HTTPS hides token strings.
 
 Examples:
   sandboxcheckr run claude
@@ -39,18 +45,32 @@ Examples:
   sandboxcheckr run --allow registry.npmjs.org -- npm install
   sandboxcheckr run --observe -- npm test  # discovers hosts; still blocks canary trips
 
+A sandboxcheckr.toml beside the code removes the flags from every later run:
+
+  # sandboxcheckr.toml
+  allow = ["localhost"]
+  allow-private-host = ["localhost"]
+  allow-port = [8000]
+  ro = ["~/tools/raptor"]
+
 Claude keeps api.anthropic.com and Codex api.openai.com unless you change it.
 Any other command starts with NO network: the proxy refuses every destination
-until you name one with --allow. A local inference endpoint is private
-address space, which the proxy refuses by default, so name the host, that
-fact, and its port explicitly:
-
-  sandboxcheckr run --allow localhost --allow-private-host localhost \
-      --allow-port 11434 -- my-local-agent
+until you name one with --allow or the policy file. A local inference endpoint
+is private address space, which the proxy refuses by default, so name the
+host, that fact, and its port explicitly.
 
 For Claude or Codex, an existing API key is passed if set; otherwise existing
-login files are granted. No other shell credentials are passed unless you name
-them with --pass-env or --rw. --no-agent-auth disables these presets.
+login files are granted. Known agents also get their state directory (omp
+gets ~/.omp). No other shell credentials are passed unless you name them
+with --pass-env or --rw. --no-agent-auth disables these presets.
+
+A python virtualenv is picked up automatically: the activated VIRTUAL_ENV,
+or .venv or venv in the project. It is granted read-only and put first on
+PATH inside the sandbox, so the interpreter and its packages resolve.
+
+The event log is per project by default: each project's runs append to a log
+under ~/.local/state/sandboxcheckr/projects/, and "sandboxcheckr console"
+run in the same project reads it back. --events chooses an explicit file.
 
 FLAGS
 `
@@ -96,26 +116,35 @@ const pathHelp = `The command is looked up in this shell's PATH, as it would be 
   - check the search path with: echo $PATH
 `
 
+// runOptions holds run's parsed flags. A project's sandboxcheckr.toml is
+// merged into it before validation, so the rest of the pipeline sees one
+// policy regardless of where each value came from.
+type runOptions struct {
+	allows, rules, ports, privHosts, passes, ro, rw multiFlag
+	observe, canaryKill, noCanary, noAgentAuth      bool
+	events, agent, denyFile                         string
+}
+
 func runSandbox(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(fs.Output(), runUsage); fs.PrintDefaults() }
 	workdir := fs.String("workdir", ".", "project `directory` (default: current directory)")
-	var allows, rules, passes, rw, ro, ports, privHosts multiFlag
-	fs.Var(&allows, "allow", "permit this destination `host`; repeatable")
-	fs.Var(&rules, "rule", "restrict an allowed host: `host:METHODS[:/path]`; repeatable")
-	fs.Var(&ports, "allow-port", "destination `port` to permit for allowed hosts; repeatable (default 443 and 80)")
-	fs.Var(&privHosts, "allow-private-host", "let this `host` resolve to a private address (a local inference server, an internal registry); repeatable. Link-local/metadata stays refused")
-	fs.Var(&passes, "pass-env", "pass this named environment variable; repeatable")
-	fs.Var(&rw, "rw", "grant this existing `path` read/write access; repeatable")
-	fs.Var(&ro, "ro", "grant this existing `path` read-only access; repeatable")
-	observe := fs.Bool("observe", false, "permit and log ordinary destinations; canary trips stay blocked")
-	eventsPath := fs.String("events", "", "shared event log `file` outside the project")
-	agent := fs.String("agent", "", "agent label in the event log")
-	denyFile := fs.String("deny-file", "", "live kill-switch `file`: hosts listed here are cut off mid-run")
-	canaryKill := fs.Bool("canary-kill", false, "stop the command on a high-confidence canary trip")
-	noCanary := fs.Bool("no-canary", false, "disable canary credentials (the proxy prints this)")
-	noAgentAuth := fs.Bool("no-agent-auth", false, "do not grant known agents their existing login credentials")
+	o := &runOptions{}
+	fs.Var(&o.allows, "allow", "permit this destination `host`; repeatable")
+	fs.Var(&o.rules, "rule", "restrict an allowed host: `host:METHODS[:/path]`; repeatable")
+	fs.Var(&o.ports, "allow-port", "destination `port` to permit for allowed hosts; repeatable (default 443 and 80)")
+	fs.Var(&o.privHosts, "allow-private-host", "let this `host` resolve to a private address (a local inference server, an internal registry); repeatable. Link-local/metadata stays refused")
+	fs.Var(&o.passes, "pass-env", "pass this named environment variable; repeatable")
+	fs.Var(&o.rw, "rw", "grant this existing `path` read/write access; repeatable")
+	fs.Var(&o.ro, "ro", "grant this existing `path` read-only access; repeatable")
+	fs.BoolVar(&o.observe, "observe", false, "permit and log ordinary destinations; canary trips stay blocked")
+	fs.StringVar(&o.events, "events", "", "event log `file` outside the project (default: this project's log)")
+	fs.StringVar(&o.agent, "agent", "", "agent label in the event log")
+	fs.StringVar(&o.denyFile, "deny-file", "", "live kill-switch `file`: hosts listed here are cut off mid-run")
+	fs.BoolVar(&o.canaryKill, "canary-kill", false, "stop the command on a high-confidence canary trip")
+	fs.BoolVar(&o.noCanary, "no-canary", false, "disable canary credentials (the proxy prints this)")
+	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -125,10 +154,6 @@ func runSandbox(args []string) int {
 	argv := fs.Args()
 	if len(argv) == 0 {
 		fs.Usage()
-		return 2
-	}
-	if *observe && (len(allows) > 0 || len(rules) > 0 || len(ports) > 0 || len(privHosts) > 0) {
-		fmt.Fprintln(os.Stderr, "--observe cannot be combined with --allow, --rule, --allow-port or --allow-private-host")
 		return 2
 	}
 	// The runner looks the command up in this shell's PATH and would fail
@@ -164,7 +189,22 @@ func runSandbox(args []string) int {
 			return 2
 		}
 	}
-	for i, host := range allows {
+	// The project's sandboxcheckr.toml is the baseline policy. It is loaded
+	// after the workdir resolves (the file lives in the workdir) and merged
+	// before validation, so every check below applies to the merged policy.
+	cfg, err := projconfig.Load(filepath.Join(project, projconfig.Name))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	mergeProjectConfig(cfg, set, o)
+	if o.observe && (len(o.allows) > 0 || len(o.rules) > 0 || len(o.ports) > 0 || len(o.privHosts) > 0) {
+		fmt.Fprintln(os.Stderr, "--observe (also from sandboxcheckr.toml) cannot be combined with --allow, --rule, --allow-port or --allow-private-host")
+		return 2
+	}
+	for i, host := range o.allows {
 		if strings.HasPrefix(host, "*.") {
 			host = host[1:]
 		}
@@ -176,9 +216,9 @@ func runSandbox(args []string) int {
 			fmt.Fprintln(os.Stderr, "--allow:", err)
 			return 2
 		}
-		allows[i] = host
+		o.allows[i] = host
 	}
-	for _, rule := range rules {
+	for _, rule := range o.rules {
 		if !safeProxyWord(rule) {
 			fmt.Fprintf(os.Stderr, "--rule: unsupported shell characters in %q\n", rule)
 			return 2
@@ -188,7 +228,7 @@ func runSandbox(args []string) int {
 			return 2
 		}
 	}
-	for _, port := range ports {
+	for _, port := range o.ports {
 		// Digits only, so the value cannot split into flags when the runner
 		// expands $ALLOW unquoted.
 		if !proxy.ValidPort(port) {
@@ -196,7 +236,7 @@ func runSandbox(args []string) int {
 			return 2
 		}
 	}
-	for _, host := range privHosts {
+	for _, host := range o.privHosts {
 		if strings.HasPrefix(host, "*.") {
 			host = host[1:]
 		}
@@ -205,37 +245,26 @@ func runSandbox(args []string) int {
 			return 2
 		}
 	}
-	for _, name := range passes {
+	for _, name := range o.passes {
 		if !validEnvName(name) {
 			fmt.Fprintf(os.Stderr, "--pass-env: invalid name %q\n", name)
 			return 2
 		}
 	}
-	for _, paths := range []*multiFlag{&rw, &ro} {
-		for i, path := range *paths {
-			if strings.ContainsAny(path, " \t\r\n*?[]") {
-				fmt.Fprintf(os.Stderr, "grant path %q contains whitespace or shell glob characters; emitted runners cannot pass it safely\n", path)
-				return 2
-			}
-			abs, err := filepath.Abs(path)
+	for _, label := range []struct {
+		paths *multiFlag
+		noun  string
+	}{
+		{&o.rw, "--rw"},
+		{&o.ro, "--ro"},
+	} {
+		for i, path := range *label.paths {
+			abs, err := validateGrant(path)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "grant path %q: %v\n", path, err)
+				fmt.Fprintf(os.Stderr, "%s: %v\n", label.noun, err)
 				return 2
 			}
-			abs, err = filepath.EvalSymlinks(abs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "grant path %q: %v\n", path, err)
-				return 2
-			}
-			if strings.ContainsAny(abs, " \t\r\n*?[]") {
-				fmt.Fprintf(os.Stderr, "grant path %q resolves to a path this runner cannot pass safely\n", path)
-				return 2
-			}
-			if mechanism.TooBroadToGrant(abs) {
-				fmt.Fprintf(os.Stderr, "grant path %q is too broad\n", path)
-				return 2
-			}
-			(*paths)[i] = abs
+			(*label.paths)[i] = abs
 		}
 	}
 	var selected mechanism.Mechanism
@@ -256,12 +285,12 @@ func runSandbox(args []string) int {
 		fmt.Fprintf(os.Stderr, "cannot start %s: %s\n", selected.ID(), availability.Detail)
 		return 1
 	}
-	selectedEvents, err := eventLogForRun(*eventsPath, project)
+	selectedEvents, err := eventLogForRun(o.events, project)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "--events:", err)
 		return 2
 	}
-	*eventsPath = selectedEvents
+	o.events = selectedEvents
 	art, err := selected.Wrapper(mechanism.Workdir{Path: project})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "generating runner:", err)
@@ -290,10 +319,57 @@ func runSandbox(args []string) int {
 		"SANDBOXCHECKR", "AGENT", "DENY_FILE", "ALLOW_DOTENV", "ALLOW_EXEC_CONFIG", "TMPDIR"} {
 		env = replaceEnv(env, name, "")
 	}
-	passNames := []string(passes)
-	rwPaths := []string(rw)
+	passNames := []string(o.passes)
+	rwPaths := []string(o.rw)
 	commandName := filepath.Base(argv[0])
-	if !*noAgentAuth {
+
+	// A detected virtualenv becomes visible inside the sandbox: its directory
+	// is bound read-only and its bin directory goes first on PATH, so the
+	// interpreter, its console scripts and its site-packages all resolve
+	// without the user writing a shell wrapper. A venv inside the workdir is
+	// already bound with the project and needs no extra grant.
+	var venvBin string
+	if root, bin, ok := detectVenv(project); ok {
+		venvBin = bin
+		passNames = append(passNames, "PATH")
+		if root != project && !strings.HasPrefix(root, project+string(filepath.Separator)) {
+			abs, err := validateGrant(root)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "venv %s: %v\n", root, err)
+				return 2
+			}
+			o.ro = append(o.ro, abs)
+		}
+		fmt.Fprintln(os.Stderr, "sandboxcheckr: using python venv", root, "(read-only, first on PATH)")
+	}
+
+	// Known agents get their state directory, without which they cannot run
+	// at all. Unlike the credential grants below this carries no secrets by
+	// design, but --no-agent-auth still turns it off: one flag means no
+	// automatic grants.
+	if !o.noAgentAuth {
+		if dirs, ok := agentStateDirs[commandName]; ok {
+			if home, err := os.UserHomeDir(); err == nil {
+				for _, name := range dirs {
+					path := filepath.Join(home, name)
+					if _, err := os.Stat(path); err != nil {
+						continue
+					}
+					if real, err := filepath.EvalSymlinks(path); err == nil {
+						path = real
+					}
+					if mechanism.TooBroadToGrant(path) || strings.ContainsAny(path, " \t\r\n*?[]") {
+						fmt.Fprintf(os.Stderr, "agent state path %q cannot be passed safely by this runner\n", path)
+						return 2
+					}
+					rwPaths = append(rwPaths, path)
+					fmt.Fprintln(os.Stderr, "sandboxcheckr: granting", commandName, "state directory", path)
+				}
+			}
+		}
+	}
+
+	if !o.noAgentAuth {
 		var key string
 		var files []string
 		switch commandName {
@@ -328,8 +404,8 @@ func runSandbox(args []string) int {
 		if real, err := filepath.EvalSymlinks(path); err == nil {
 			path = real
 		}
-		if *eventsPath == path || strings.HasPrefix(*eventsPath, path+string(filepath.Separator)) {
-			fmt.Fprintf(os.Stderr, "event log %s is inside a read/write grant %s; choose --events outside that grant\n", *eventsPath, path)
+		if o.events == path || strings.HasPrefix(o.events, path+string(filepath.Separator)) {
+			fmt.Fprintf(os.Stderr, "event log %s is inside a read/write grant %s; choose --events outside that grant\n", o.events, path)
 			return 2
 		}
 	}
@@ -339,26 +415,43 @@ func runSandbox(args []string) int {
 	if len(rwPaths) > 0 {
 		env = replaceEnv(env, "EXTRA_RW", strings.Join(unique(rwPaths), " "))
 	}
-	if len(ro) > 0 {
-		env = replaceEnv(env, "EXTRA_RO", strings.Join(unique(ro), " "))
+	if len(o.ro) > 0 {
+		env = replaceEnv(env, "EXTRA_RO", strings.Join(unique(o.ro), " "))
 	}
-	env = replaceEnv(env, "EVENTS", *eventsPath)
-	if *agent != "" {
-		env = replaceEnv(env, "AGENT", *agent)
+	if venvBin != "" {
+		// PASS_ENV=PATH passes the runner shell's PATH through --setenv, and
+		// the runner's per-run --setenv lands after the baked ones, so this
+		// replaces the sandbox's PATH rather than fighting it.
+		if host := os.Getenv("PATH"); host != "" {
+			env = replaceEnv(env, "PATH", venvBin+":"+host)
+		} else {
+			env = replaceEnv(env, "PATH", venvBin)
+		}
 	}
-	if *denyFile != "" {
-		env = replaceEnv(env, "DENY_FILE", *denyFile)
+	env = replaceEnv(env, "EVENTS", o.events)
+	if o.agent != "" {
+		env = replaceEnv(env, "AGENT", o.agent)
 	}
-	if *canaryKill {
+	if o.denyFile != "" {
+		env = replaceEnv(env, "DENY_FILE", o.denyFile)
+	}
+	if o.canaryKill {
 		env = replaceEnv(env, "CANARY_KILL", "1")
 	}
-	if *noCanary {
+	if o.noCanary {
 		env = replaceEnv(env, "CANARY", "0")
 	}
-	if *observe {
+	if o.observe {
 		env = replaceEnv(env, "ALLOW", "--observe")
 	} else {
-		env = replaceEnv(env, "ALLOW", allowFlagsFor(commandName, allows, rules, ports, privHosts))
+		env = replaceEnv(env, "ALLOW", allowFlagsFor(commandName, o.allows, o.rules, o.ports, o.privHosts))
+	}
+	// Permitted ports are also bound on the sandbox's loopback, so tools that
+	// bypass HTTP proxies for localhost (NO_PROXY listing loopback hosts)
+	// still traverse the egress proxy. The bridge's own port is excluded: it
+	// is already listening there.
+	if bindPorts := bindPortsFor(o.ports); len(bindPorts) > 0 {
+		env = replaceEnv(env, "BIND_PORTS", strings.Join(bindPorts, ","))
 	}
 
 	cmd := exec.Command("/bin/sh", append([]string{filepath.Join(private, art.FileName)}, argv...)...)
@@ -441,6 +534,21 @@ func unique(xs []string) []string {
 	return out
 }
 
+// bindPortsFor picks the permitted ports to bind on the sandbox's loopback:
+// every distinct port except the bridge's own, which is already listening
+// there.
+func bindPortsFor(ports []string) []string {
+	proxy := strconv.Itoa(mechanisms.DefaultProxyPort)
+	var out []string
+	for _, port := range unique(ports) {
+		if port == proxy {
+			continue
+		}
+		out = append(out, port)
+	}
+	return out
+}
+
 func validEnvName(s string) bool {
 	if s == "" {
 		return false
@@ -495,6 +603,126 @@ func resolveOutsideProject(label, path, project string) (string, error) {
 	return p, nil
 }
 
+// validateGrant applies the checks every filesystem grant goes through,
+// whether it came from --rw/--ro, the policy file, venv autodetect or an
+// agent preset. The runner passes grants through a shell word list, so no
+// whitespace or glob characters, and nothing too broad to bind.
+func validateGrant(path string) (string, error) {
+	if strings.ContainsAny(path, " \t\r\n*?[]") {
+		return "", fmt.Errorf("grant path %q contains whitespace or shell glob characters; emitted runners cannot pass it safely", path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	if strings.ContainsAny(abs, " \t\r\n*?[]") {
+		return "", fmt.Errorf("grant path %q resolves to a path this runner cannot pass safely", abs)
+	}
+	if mechanism.TooBroadToGrant(abs) {
+		return "", fmt.Errorf("grant path %q is too broad", abs)
+	}
+	return abs, nil
+}
+
+// mergeProjectConfig applies the project's sandboxcheckr.toml as the
+// baseline: list keys union (config values first, then the command line's),
+// scalar keys fill in only where the user did not set the flag themselves.
+// set holds the flags the user actually passed, from fs.Visit.
+func mergeProjectConfig(cfg *projconfig.Config, set map[string]bool, o *runOptions) {
+	if cfg == nil {
+		return
+	}
+	o.allows = unique(append(append([]string{}, cfg.Allows...), o.allows...))
+	o.rules = unique(append(append([]string{}, cfg.Rules...), o.rules...))
+	o.ports = unique(append(append([]string{}, cfg.Ports...), o.ports...))
+	o.privHosts = unique(append(append([]string{}, cfg.PrivHosts...), o.privHosts...))
+	o.passes = unique(append(append([]string{}, cfg.PassEnv...), o.passes...))
+	o.ro = unique(append(append([]string{}, cfg.RO...), o.ro...))
+	o.rw = unique(append(append([]string{}, cfg.RW...), o.rw...))
+	if !set["observe"] {
+		o.observe = cfg.Observe
+	}
+	if !set["no-canary"] {
+		o.noCanary = cfg.NoCanary
+	}
+	if !set["canary-kill"] {
+		o.canaryKill = cfg.CanaryKill
+	}
+	if !set["no-agent-auth"] {
+		o.noAgentAuth = cfg.NoAgentAuth
+	}
+	if !set["events"] && cfg.Events != "" {
+		o.events = cfg.Events
+	}
+	if !set["agent"] && cfg.Agent != "" {
+		o.agent = cfg.Agent
+	}
+	if !set["deny-file"] && cfg.DenyFile != "" {
+		o.denyFile = cfg.DenyFile
+	}
+}
+
+// agentStateDirs maps known agent commands to state directories inside the
+// user's home that the agent needs to function. These are functional grants,
+// not credentials; the credential presets live in runSandbox's switch.
+var agentStateDirs = map[string][]string{
+	"omp": {".omp"},
+}
+
+// detectVenv finds a python virtualenv to make visible inside the sandbox:
+// the shell's activated VIRTUAL_ENV first, then .venv or venv in the project.
+// It returns the venv root (to bind) and its bin directory (for PATH).
+func detectVenv(project string) (root, bin string, ok bool) {
+	if v := os.Getenv("VIRTUAL_ENV"); v != "" {
+		if abs, err := filepath.Abs(v); err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil {
+				if fi, err := os.Stat(real); err == nil && fi.IsDir() && dirExists(filepath.Join(real, "bin")) {
+					return real, filepath.Join(real, "bin"), true
+				}
+			}
+		}
+	}
+	for _, name := range []string{".venv", "venv"} {
+		root := filepath.Join(project, name)
+		if dirExists(filepath.Join(root, "bin")) {
+			return root, filepath.Join(root, "bin"), true
+		}
+	}
+	return "", "", false
+}
+
+func dirExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
+}
+
+// sandboxcheckrStateDir is where sandboxcheckr keeps per-run state, honouring
+// XDG_STATE_HOME.
+func sandboxcheckrStateDir() string {
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "sandboxcheckr")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "sandboxcheckr")
+}
+
+// projectEventsPath is the per-project default event log: a stable short
+// hash of the project's absolute path, so different projects never interleave
+// and the console can find the log again from the same directory.
+func projectEventsPath(project string) string {
+	sum := sha256.Sum256([]byte(project))
+	return filepath.Join(sandboxcheckrStateDir(), "projects", hex.EncodeToString(sum[:4]), "events.jsonl")
+}
+
+// eventLogForRun resolves the event log for a run: an explicit path wins;
+// otherwise the project's own log under ~/.local/state/sandboxcheckr/, with
+// the shared default log as fallback (e.g. a read-only state directory).
+// Whatever is chosen must sit outside the project, or the sandboxed program
+// could rewrite the evidence.
 func eventLogForRun(explicit, project string) (string, error) {
 	resolve := func(path string) (string, error) {
 		return resolveOutsideProject("event log", path, project)
@@ -502,7 +730,7 @@ func eventLogForRun(explicit, project string) (string, error) {
 	if explicit != "" {
 		return resolve(explicit)
 	}
-	candidates := []string{defaultEventsPath()}
+	candidates := []string{projectEventsPath(project), defaultEventsPath()}
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates, filepath.Join(home, ".cache", "sandboxcheckr", "events.jsonl"))
 	}

@@ -285,18 +285,18 @@ func TestBlockUnblock(t *testing.T) {
 
 func TestRefusalClasses(t *testing.T) {
 	cases := map[string]string{
-		"in deny file (localhost)":                "kill switch (deny file)",
-		"resolved to non-public address 127.0.0.1; refusing (use --allow-private-host localhost to permit this host only)": "private address",
+		"in deny file (localhost)": "kill switch (deny file)",
+		"resolved to non-public address 127.0.0.1; refusing (use --allow-private-host localhost to permit this host only)":             "private address",
 		"resolved to non-public address 169.254.169.254; refusing (use --allow-private-host 169.254.169.254 to permit this host only)": "cloud metadata endpoint",
-		"not in allow-list":                                    "not on the allow-list",
-		"port not permitted; use --allow-port":                 "port not permitted",
-		"rule github.com:GET,HEAD:/x/: method PUT not permitted (allowed: GET,HEAD)": "outside its --rule (method)",
+		"not in allow-list":                    "not on the allow-list",
+		"port not permitted; use --allow-port": "port not permitted",
+		"rule github.com:GET,HEAD:/x/: method PUT not permitted (allowed: GET,HEAD)":  "outside its --rule (method)",
 		"rule github.com:GET,HEAD:/x/: path contains traversal or encoded separators": "outside its --rule (path)",
-		"canary credential":                                    "canary credential use",
+		"canary credential": "canary credential use",
 	}
 	for in, want := range cases {
-		if got := refusalClass(in); got != want {
-			t.Errorf("refusalClass(%q) = %q, want %q", in, got, want)
+		if got := RefusalClass(in); got != want {
+			t.Errorf("RefusalClass(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
