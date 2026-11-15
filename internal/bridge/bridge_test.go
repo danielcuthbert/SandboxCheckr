@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,9 +24,23 @@ type fakeProxy struct {
 	lastBind string // the bound permitted port, set by startBridge
 }
 
+// sockPath returns a unix socket path short enough for macOS, whose per-user
+// temp directories push the usual t.TempDir() paths past the kernel's
+// 104-character sun_path limit and make bind fail with EINVAL.
+func sockPath(t *testing.T, name string) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "scheckr")
+	if err != nil {
+		// No /tmp to write to: fall back and rely on a longer sun_path.
+		return filepath.Join(t.TempDir(), name)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return filepath.Join(d, name)
+}
+
 func startFakeProxy(t *testing.T, deny bool) *fakeProxy {
 	t.Helper()
-	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "proxy.sock"))
+	ln, err := net.Listen("unix", sockPath(t, "proxy.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}

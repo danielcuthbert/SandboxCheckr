@@ -68,6 +68,20 @@ func fakeDNSOverTCP(t *testing.T, respond func(query []byte) []byte) string {
 	return ln.Addr().String()
 }
 
+// sockPath returns a unix socket path short enough for macOS, whose per-user
+// temp directories push the usual t.TempDir() paths past the kernel's
+// 104-character sun_path limit and make bind fail with EINVAL.
+func sockPath(t *testing.T, name string) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "scheckr")
+	if err != nil {
+		// No /tmp to write to: fall back and rely on a longer sun_path.
+		return filepath.Join(t.TempDir(), name)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return filepath.Join(d, name)
+}
+
 // startDNSProxy starts a server with a DNS relay socket and returns a client
 // connection to it.
 func startDNSProxy(t *testing.T, srv *Server) net.Conn {
@@ -75,7 +89,7 @@ func startDNSProxy(t *testing.T, srv *Server) net.Conn {
 	if _, err := srv.Listen(0); err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(t.TempDir(), "dns.sock")
+	sock := sockPath(t, "dns.sock")
 	if err := srv.ListenDNS(sock); err != nil {
 		t.Fatal(err)
 	}

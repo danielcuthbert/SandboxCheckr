@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -13,7 +12,7 @@ import (
 // TestDNSRelayForwardsQueriesToProxy sends a query through the UDP relay to a
 // fake proxy that echoes framed queries back, and expects the reply.
 func TestDNSRelayForwardsQueriesToProxy(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dns.sock")
+	sock := sockPath(t, "dns.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +85,7 @@ func TestDNSRelayForwardsQueriesToProxy(t *testing.T) {
 // TestDNSRelayDropsQueriesWhenProxyGone checks that a dead proxy is a dropped
 // datagram, not a crash: the relay keeps serving.
 func TestDNSRelayDropsQueriesWhenProxyGone(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dns.sock") // nothing listens here
+	sock := sockPath(t, "dns.sock") // nothing listens here
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pc, err := BindDNS("127.0.0.1:0")
