@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -68,6 +69,16 @@ type Server struct {
 	matcherOnce sync.Once
 	matcher     *canary.Matcher
 	ln          net.Listener
+	// dnsLn carries relayed DNS queries from the sandbox's bridge, when
+	// ListenDNS has bound it.
+	dnsLn net.Listener
+	// Resolver is the host-side resolver the DNS relay forwards allowed
+	// queries to, as host:port speaking DNS over TCP. Empty means the first
+	// nameserver in /etc/resolv.conf, parsed once.
+	Resolver     string
+	resolverOnce sync.Once
+	resolverHost string
+	resolverErr  error
 	// live holds open tunnels, so a deny-file edit can cut them.
 	live map[net.Conn]string
 }
@@ -263,9 +274,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = s.ln.Close()
+		if s.dnsLn != nil {
+			_ = s.dnsLn.Close()
+		}
 	}()
 	if s.Deny != nil {
 		go s.watchDeny(ctx)
+	}
+	if s.dnsLn != nil {
+		go s.acceptDNS(ctx)
 	}
 
 	for {
@@ -686,6 +703,272 @@ func (s *Server) finish(host, port string, sent, recv int64) {
 		s.logf("WARN  %s:%s  has now received %s from the sandbox — far more than downloads, API "+
 			"calls or git fetches send. Something is being uploaded to it.", host, port, HumanBytes(after))
 	}
+}
+
+// ListenDNS binds a second unix socket that carries DNS queries relayed by
+// the sandbox's bridge. It must be called before Serve.
+func (s *Server) ListenDNS(path string) error {
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+	s.dnsLn = ln
+	return nil
+}
+
+// acceptDNS serves the DNS relay socket until the context is cancelled.
+func (s *Server) acceptDNS(ctx context.Context) {
+	for {
+		c, err := s.dnsLn.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		go s.handleDNS(ctx, c)
+	}
+}
+
+// handleDNS serves one bridge relay connection: a sequence of framed queries,
+// one response each, in order. The framing is a 4-byte big-endian length plus
+// the raw DNS message — the bridge speaks it, nothing else sees the socket.
+func (s *Server) handleDNS(ctx context.Context, c net.Conn) {
+	defer c.Close()
+	br := bufio.NewReader(c)
+	var lenBuf [4]byte
+	for {
+		if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
+			return
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		if n == 0 || n > 65535 {
+			return
+		}
+		query := make([]byte, n)
+		if _, err := io.ReadFull(br, query); err != nil {
+			return
+		}
+		resp := s.answerDNS(ctx, query)
+		out := make([]byte, 4+len(resp))
+		binary.BigEndian.PutUint32(out, uint32(len(resp)))
+		copy(out[4:], resp)
+		if _, err := c.Write(out); err != nil {
+			return
+		}
+	}
+}
+
+// answerDNS gates one query and, for allowed names, relays it to the
+// host-side resolver over TCP. Resolution follows the same policy as
+// connections — canary, kill switch, allow-list — because a query name is
+// itself information leaving the sandbox, and because a resolution is only
+// useful when the connection it enables could be allowed anyway. The
+// connection gate still applies afterwards: resolving a name permits nothing.
+func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
+	name, qtype, ok := dnsQuestion(query)
+	if !ok {
+		return dnsError(query, dnsRCODEServFail)
+	}
+	name = strings.TrimSuffix(name, ".")
+	if s.Canaries != nil {
+		if c, ok := s.canaryMatcher().Host(name); ok {
+			s.trip(c, name, "53", "DNS", "medium")
+			s.dnsEvent(name, qtype, events.Deny, "canary credential")
+			return dnsError(query, dnsRCODERefused)
+		}
+	}
+	if s.Deny != nil {
+		if entry, hit := s.Deny.Match(name); hit {
+			s.dnsEvent(name, qtype, events.Deny, "in deny file ("+entry+")")
+			return dnsError(query, dnsRCODERefused)
+		}
+	}
+	observe := false
+	if !s.Allow.PermitsHost(name) {
+		if !s.Observe {
+			s.dnsEvent(name, qtype, events.Deny, "not in allow-list")
+			return dnsError(query, dnsRCODERefused)
+		}
+		observe = true
+	}
+	resp, err := s.resolveDNS(ctx, query)
+	if err != nil {
+		s.logf("DNS   %s (%s)  (relay failed: %v)", name, qtype, err)
+		s.dnsEvent(name, qtype, events.Deny, "resolution failed")
+		return dnsError(query, dnsRCODEServFail)
+	}
+	if observe {
+		s.logf("DNS   %s (%s)  (would be DENIED when enforcing)", name, qtype)
+		s.dnsEvent(name, qtype, events.Observe, "not in allow-list")
+	} else {
+		s.logf("DNS   %s (%s)", name, qtype)
+		s.dnsEvent(name, qtype, events.Allow, "")
+	}
+	return resp
+}
+
+// dnsEvent records one resolution. It stays out of the connection stats: a
+// lookup is not a connection, and the summaries count connections.
+func (s *Server) dnsEvent(host, qtype, decision, reason string) {
+	s.event(events.Event{Kind: events.KindDns, Decision: decision, Host: host,
+		Port: "53", Method: qtype, Reason: reason})
+}
+
+// resolveDNS forwards the raw query to the host-side resolver over TCP
+// (RFC 7766): two-byte length prefix in, the same out. The resolver is
+// reached from the host, where it lives; the sandbox never sees an address.
+func (s *Server) resolveDNS(ctx context.Context, query []byte) ([]byte, error) {
+	resolver, err := s.relayResolver()
+	if err != nil {
+		return nil, err
+	}
+	c, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", resolver)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(query)))
+	if _, err := c.Write(lenBuf[:]); err != nil {
+		return nil, err
+	}
+	if _, err := c.Write(query); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
+	if _, err := io.ReadFull(c, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// relayResolver returns the resolver to relay to: the Server's explicit
+// override, else the first nameserver in /etc/resolv.conf, parsed once.
+func (s *Server) relayResolver() (string, error) {
+	if s.Resolver != "" {
+		return s.Resolver, nil
+	}
+	s.resolverOnce.Do(func() {
+		data, err := os.ReadFile("/etc/resolv.conf")
+		if err != nil {
+			s.resolverErr = err
+			return
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if ns, found := strings.CutPrefix(line, "nameserver "); found {
+				ns = strings.TrimSpace(ns)
+				if ip := net.ParseIP(ns); ip != nil {
+					s.resolverHost = net.JoinHostPort(ns, "53")
+					return
+				}
+			}
+		}
+		s.resolverErr = fmt.Errorf("no nameserver in /etc/resolv.conf")
+	})
+	if s.resolverErr != nil {
+		return "", s.resolverErr
+	}
+	return s.resolverHost, nil
+}
+
+// DNS response codes for synthesized refusals.
+const (
+	dnsRCODEServFail = 2
+	dnsRCODERefused  = 5
+)
+
+// dnsError answers a query with just a response code: the question echoed, no
+// answers, QR set. A refusal or failure is honest with the program — it
+// retries, gives up or reports, exactly as with an unreachable resolver —
+// without inventing a lie like NXDOMAIN.
+func dnsError(query []byte, rcode int) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+	end := 12
+	qd := binary.BigEndian.Uint16(query[4:6])
+	if qd == 1 {
+		// Walk the question so the echo stops after it.
+		pos := 12
+		for {
+			if pos >= len(query) {
+				return nil
+			}
+			n := int(query[pos])
+			pos++
+			if n == 0 {
+				break
+			}
+			if n > 63 || pos+n > len(query) {
+				return nil
+			}
+			pos += n
+		}
+		if pos+4 > len(query) {
+			return nil
+		}
+		end = pos + 4
+	} else {
+		qd = 0
+	}
+	resp := make([]byte, end)
+	copy(resp, query[:end])
+	resp[2] = query[2]&0x78 | 0x80 // QR=1, opcode preserved, rest cleared
+	resp[3] = byte(rcode)
+	binary.BigEndian.PutUint16(resp[4:6], qd)
+	binary.BigEndian.PutUint16(resp[6:8], 0)
+	binary.BigEndian.PutUint16(resp[8:10], 0)
+	binary.BigEndian.PutUint16(resp[10:12], 0)
+	return resp
+}
+
+// dnsQuestion extracts the question name and type from a DNS query: a 12-byte
+// header, then QNAME as length-prefixed labels, then qtype and qclass.
+// Compression pointers cannot appear in a question, so the parse is flat.
+func dnsQuestion(query []byte) (name, qtype string, ok bool) {
+	if len(query) < 12 {
+		return "", "", false
+	}
+	if binary.BigEndian.Uint16(query[4:6]) != 1 {
+		return "", "", false
+	}
+	pos := 12
+	var labels []string
+	for {
+		if pos >= len(query) {
+			return "", "", false
+		}
+		n := int(query[pos])
+		pos++
+		if n == 0 {
+			break
+		}
+		if n > 63 || pos+n > len(query) {
+			return "", "", false
+		}
+		labels = append(labels, string(query[pos:pos+n]))
+		pos += n
+	}
+	if pos+4 > len(query) {
+		return "", "", false
+	}
+	switch t := binary.BigEndian.Uint16(query[pos : pos+2]); t {
+	case 1:
+		qtype = "A"
+	case 28:
+		qtype = "AAAA"
+	default:
+		qtype = fmt.Sprintf("type%d", t)
+	}
+	return strings.Join(labels, "."), qtype, true
 }
 
 func (s *Server) track(c net.Conn, host string) {

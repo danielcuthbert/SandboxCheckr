@@ -380,3 +380,57 @@ func TestSummaryShowsNewSections(t *testing.T) {
 		}
 	}
 }
+
+// DNS events make their own host:port rows and count as refusals when
+// denied, so a host that was only ever looked up is still visible in hosts
+// and charged to the agent that looked it up.
+func TestHostsAndAgentsCountDns(t *testing.T) {
+	dns := func(sec int, agent, decision, host string) events.Event {
+		e := ev(sec, agent, events.KindDns, decision, host, "", false)
+		e.Port = "53"
+		return e
+	}
+	evs := []events.Event{
+		dns(0, "a1", events.Deny, "blocked.test"),
+		dns(1, "a1", events.Allow, "allowed.test"),
+		dns(2, "a2", events.Deny, "blocked.test"),
+	}
+	var out bytes.Buffer
+	c := &Console{Out: Printer{W: &out}}
+	c.SetEvents(evs)
+	if err := c.Run(context.Background(), "hosts"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "blocked.test:53") || !strings.Contains(out.String(), "allowed.test:53") {
+		t.Fatalf("hosts lacks the dns rows:\n%s", out.String())
+	}
+	// Two agents were refused at blocked.test; allowed.test was only resolved.
+	if !strings.Contains(out.String(), "a1,a2") {
+		t.Fatalf("hosts does not attribute the refused lookups:\n%s", out.String())
+	}
+	var blocked *HostSummary
+	for i := range Hosts(evs) {
+		if Hosts(evs)[i].Host == "blocked.test" {
+			blocked = &Hosts(evs)[i]
+		}
+	}
+	if blocked == nil || blocked.Denied != 2 {
+		t.Fatalf("blocked.test row wrong: %+v", blocked)
+	}
+	var out2 bytes.Buffer
+	c2 := &Console{Out: Printer{W: &out2}}
+	c2.SetEvents(evs)
+	if err := c2.Run(context.Background(), "agents"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out2.String(), "a1") {
+		t.Fatalf("agents lacks a1:\n%s", out2.String())
+	}
+	byAgent := map[string]AgentSummary{}
+	for _, a := range Agents(evs) {
+		byAgent[a.Agent] = a
+	}
+	if byAgent["a1"].Denied != 1 || byAgent["a2"].Denied != 1 {
+		t.Fatalf("agent denials = %d and %d, want 1 each", byAgent["a1"].Denied, byAgent["a2"].Denied)
+	}
+}

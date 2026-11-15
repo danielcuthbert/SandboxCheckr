@@ -185,6 +185,11 @@ func Agents(evs []events.Event) []AgentSummary {
 			if e.Decision == events.Deny {
 				a.Denied++
 			}
+		case events.KindDns:
+			if e.Decision == events.Deny {
+				a.Denied++
+			}
+			hosts[e.Agent][e.Host] = true
 		case events.KindWrite:
 			a.Writes++
 		case events.KindUpload:
@@ -246,6 +251,11 @@ func Hosts(evs []events.Event) []HostSummary {
 			if e.Decision == events.Deny {
 				h.Denied++
 			}
+		case events.KindDns:
+			if e.Decision == events.Deny {
+				h.Denied++
+			}
+			agents[k][e.Agent] = true
 		case events.KindClose:
 			h.Sent += e.Sent
 			h.Recv += e.Recv

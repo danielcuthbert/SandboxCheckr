@@ -36,7 +36,7 @@ FILTERS (combine freely)
   agent=<name>  agent=claude-*   one agent, or a prefix
   host=<text>                    host contains text
   decision=allow|deny|observe
-  kind=connect|request|write|upload|close|canary
+  kind=connect|request|write|upload|close|canary|dns
   since=15m  since=2026-10-12T09:00:00Z
   relay                          store-or-forward hosts only
 

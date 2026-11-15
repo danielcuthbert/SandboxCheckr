@@ -80,6 +80,13 @@ func TestProxiedRunnerBindsPermittedPorts(t *testing.T) {
 	for _, want := range []string{
 		`BIND_PORTS="${BIND_PORTS:-}"`,
 		`${BIND_PORTS:+--bind-ports "$BIND_PORTS"}`,
+		`--dns-unix "$PRIVDIR/dns.sock"`,
+		`--dns-sock "$PRIV_IN/dns.sock"`,
+		`printf 'nameserver 127.0.0.1\noptions timeout:2 attempts:2\n' > "$PRIVDIR/resolv.conf"`,
+		`RESOLV_TARGET=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)`,
+		`--ro-bind "$PRIVDIR/resolve" "$(dirname "$RESOLV_TARGET")"`,
+		`--ro-bind "$PRIVDIR/resolv.conf" /etc/resolv.conf`,
+		`set -- unshare --user --map-root-user --net "$@"`,
 	} {
 		if !strings.Contains(art.FileBody, want) {
 			t.Errorf("proxied runner lacks %q", want)

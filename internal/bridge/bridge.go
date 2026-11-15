@@ -19,6 +19,7 @@ package bridge
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -113,6 +114,89 @@ func relay(c net.Conn, to string) {
 	}
 	defer u.Close()
 	pipeBoth(c, u)
+}
+
+// ServeDNS relays DNS queries from the sandbox's loopback to the proxy's DNS
+// socket. It binds listen — 127.0.0.1:53053, the address the sandbox's
+// resolv.conf points at — and answers each datagram by exchanging a framed
+// query with the proxy, which gates the name and resolves host-side. A query
+// that cannot be relayed is dropped: the client retries, and an unreachable
+// resolver is exactly what the sandbox looks like when the proxy is gone.
+// The bind can fail when the policy permits port 53 for tunnelling; the
+// failure is reported and resolution is simply unavailable.
+func ServeDNS(ctx context.Context, listen, sock string, onBindError func(err error)) {
+	pc, err := BindDNS(listen)
+	if err != nil {
+		if onBindError != nil {
+			onBindError(err)
+		}
+		return
+	}
+	ServeDNSConn(ctx, pc, sock)
+}
+
+// BindDNS binds the UDP relay socket.
+func BindDNS(listen string) (net.PacketConn, error) {
+	return net.ListenPacket("udp", listen)
+}
+
+// ServeDNSConn relays DNS queries on an already bound socket until the
+// context is cancelled.
+func ServeDNSConn(ctx context.Context, pc net.PacketConn, sock string) {
+	go func() { <-ctx.Done(); _ = pc.Close() }()
+	buf := make([]byte, 64*1024)
+	sem := make(chan struct{}, 64)
+	for {
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		query := make([]byte, n)
+		copy(query, buf[:n])
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		go func() {
+			defer func() { <-sem }()
+			resp, err := exchange(sock, query)
+			if err == nil {
+				_, _ = pc.WriteTo(resp, addr)
+			}
+		}()
+	}
+}
+
+// exchange performs one framed query against the proxy's DNS socket: a 4-byte
+// big-endian length plus the raw DNS message, response the same way.
+func exchange(sock string, query []byte) ([]byte, error) {
+	c, err := net.DialTimeout("unix", sock, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(query)))
+	if _, err := c.Write(lenBuf[:]); err != nil {
+		return nil, err
+	}
+	if _, err := c.Write(query); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+	if _, err := io.ReadFull(c, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // relayTunneled serves a connection to a bound permitted port: the client

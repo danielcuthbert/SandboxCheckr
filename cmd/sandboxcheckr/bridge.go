@@ -45,12 +45,13 @@ func runBridge(args []string) int {
 	listen := fs.String("listen", "127.0.0.1:8899", "loopback address to listen on inside the sandbox")
 	to := fs.String("to", "", "unix socket of the allow-listing proxy")
 	bindPorts := fs.String("bind-ports", "", "comma-separated permitted ports to also bind on the sandbox loopback, tunnelling direct connections through the proxy")
+	dnsSock := fs.String("dns-sock", "", "proxy unix socket carrying gated DNS queries; binds 127.0.0.1:53 on the sandbox loopback for the sandbox resolver")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	argv := fs.Args()
 	if *to == "" || len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: __bridge --to <socket> [--bind-ports 8000,8080] -- <command> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: __bridge --to <socket> [--bind-ports 8000,8080] [--dns-sock <socket>] -- <command> [args...]")
 		return 2
 	}
 	binds, err := parseBindPorts(*bindPorts)
@@ -61,6 +62,10 @@ func runBridge(args []string) int {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The runner may put this bridge in its own network namespace (so the
+	// DNS relay can bind port 53 unprivileged); a fresh namespace starts with
+	// the interface down, and nothing binds until it is up.
+	bridge.EnsureLoopback()
 	ready := make(chan struct{})
 	errc := make(chan error, 1)
 	go func() {
@@ -73,6 +78,11 @@ func runBridge(args []string) int {
 	case err := <-errc:
 		fmt.Fprintln(os.Stderr, "bridge:", err)
 		return 1
+	}
+	if *dnsSock != "" {
+		go bridge.ServeDNS(ctx, "127.0.0.1:53", *dnsSock, func(err error) {
+			fmt.Fprintf(os.Stderr, "bridge: not binding 127.0.0.1:53 for the DNS relay: %v\n", err)
+		})
 	}
 
 	cmd := exec.Command(argv[0], argv[1:]...)

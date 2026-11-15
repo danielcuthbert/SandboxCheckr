@@ -167,6 +167,34 @@ program that ignores the proxy gets no network at all.
 | Uploads | counted per host; > 1 MiB flagged; the first data-sending request to a host is flagged at any size (plain HTTP and `--rule` hosts) | — |
 | Code hosts | `raw.githubusercontent.com`, gist, GitLab, Hugging Face: a path rule is suggested, not just download-only | `--rule raw.githubusercontent.com:GET,HEAD:/your-org/` |
 
+**Name resolution**
+
+A proxied sandbox resolves names too. Its resolver points at a relay on the
+sandbox's own loopback, which hands each lookup to the proxy over a unix
+socket; the proxy gates the name against the same policy as a connection —
+canary hosts, the kill switch, the allow-list — and only then resolves it on
+the host, where the resolver actually lives. The sandbox never sees your
+resolver or a route to it, and no UDP leaves the namespace.
+
+A lookup is a signal as well as a prerequisite: a query name can carry data,
+so it is gated like everything else that leaves the sandbox. Refused lookups
+answer REFUSED rather than a fake NXDOMAIN, and each one is logged — `kind=dns`
+in the console, and a row in the destinations table when a host only ever
+resolved but never connected. Resolution alone permits nothing: the connection
+gate still applies afterwards, so resolving `burpbountylab.com` does not
+exempt the connection from the port rules. Scanning a plain HTTP target
+therefore needs both the host and the port:
+
+```sh
+sandboxcheckr run --allow burpbountylab.com --allow-port 80 -- ./bin/raptor web --url http://burpbountylab.com
+```
+
+The relay binds port 53, which needs a network namespace of its own; the
+runner uses `unshare` (util-linux) for it and the bridge brings the loopback
+up inside. Where `unshare` is unavailable or disallowed, name resolution is
+unavailable and everything else still works: lookups fail the way they do
+with no resolver at all.
+
 **Use it**
 
 ```sh
@@ -305,6 +333,10 @@ Store-or-forward hosts the program tried (relays, message boards, ways onward):
 
 A refusal there is not noise: it is the program looking for a way out or a
 place to leave a message.
+
+Refused name lookups show up the same way: a `kind=dns` event on `denied` and
+`events`, and a `host:53` row on `hosts` naming the agents that looked the
+host up.
 
 **Kill switch.** The allow-list is set when a run starts. To cut a host off
 *during* a run, add it to `~/.config/sandboxcheckr/deny.txt` (or pass

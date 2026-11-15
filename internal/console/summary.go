@@ -184,6 +184,10 @@ func Summarise(evs []events.Event) Summary {
 		switch e.Kind {
 		case events.KindClose:
 			s.Sent += e.Sent
+		case events.KindDns:
+			if e.Decision == events.Deny {
+				s.Denied++
+			}
 		case events.KindConnect:
 			s.Connects++
 			hosts[e.Host] = true
@@ -260,6 +264,13 @@ func Summarise(evs []events.Event) Summary {
 		case events.KindRequest:
 			if refused && e.Reason != "" {
 				reasons[RefusalClass(e.Reason)]++
+			}
+		case events.KindDns:
+			if refused {
+				h.Denied++
+				if e.Reason != "" {
+					reasons[RefusalClass(e.Reason)]++
+				}
 			}
 		case events.KindClose:
 			h.Sent += e.Sent

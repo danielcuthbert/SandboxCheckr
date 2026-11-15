@@ -128,6 +128,7 @@ func runProxy(args []string) int {
 	fs.Var(&rules, "rule", "restrict an allowed host: `host:METHODS[:/path,/path]`, e.g. registry.internal:GET,HEAD; repeatable. Ruled hosts are TLS-inspected")
 	port := fs.Int("port", 0, "loopback `port` to bind (0 picks a free one; the address is printed on stdout)")
 	unixSock := fs.String("unix", "", "listen on this unix socket `path` instead of a loopback TCP port")
+	dnsUnix := fs.String("dns-unix", "", "serve the sandbox's gated DNS relay on this unix `path` (runner scripts point the sandbox resolver here)")
 	observe := fs.Bool("observe", false,
 		"permit ordinary destinations and log them; configured canary trips stay blocked")
 	allowPrivate := fs.Bool("allow-private", false,
@@ -266,6 +267,15 @@ func runProxy(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "listen:", err)
 		return 1
+	}
+	if *dnsUnix != "" {
+		if err := srv.ListenDNS(*dnsUnix); err != nil {
+			fmt.Fprintln(os.Stderr, "dns listen:", err)
+			return 1
+		}
+		defer os.Remove(*dnsUnix)
+		fmt.Fprintln(os.Stderr, "dns relay: name resolution inside the sandbox is gated by the allow-list, "+
+			"and refusals are logged like connections")
 	}
 
 	// Printed to stdout so a wrapper script can capture it; everything else

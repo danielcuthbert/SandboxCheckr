@@ -36,6 +36,10 @@ const (
 	// KindClose carries the byte counts for a finished connection.
 	KindClose  = "close"
 	KindCanary = "canary"
+	// KindDns is one name resolution the sandbox relayed to the proxy. It is
+	// gated by the allow-list like a connection, because a query name is
+	// itself information leaving the sandbox.
+	KindDns = "dns"
 )
 
 // Decisions.

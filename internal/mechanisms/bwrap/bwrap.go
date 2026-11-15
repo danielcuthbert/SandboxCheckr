@@ -445,6 +445,13 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 		// able to edit its own kill switch.
 		b.WriteString("DENY_FILE=\"${DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/sandboxcheckr/deny.txt}\"\n")
 		b.WriteString("CA_BUNDLE=\"$PRIVDIR/ca.pem\"\n")
+		// Name resolution inside the sandbox goes to the proxy's gated DNS
+		// relay on the loopback the bridge binds. The relay file is prepared
+		// here; the bind that puts it where the resolver looks is emitted with
+		// the other binds, once /etc/resolv.conf's true location is known.
+		// The relay sits on port 53, which the bridge can bind because it runs
+		// in its own network namespace (see the unshare below).
+		b.WriteString("printf 'nameserver 127.0.0.1\\noptions timeout:2 attempts:2\\n' > \"$PRIVDIR/resolv.conf\"\n")
 	}
 	b.WriteString(`
 [ $# -ge 1 ] || { echo "usage: sh $0 <command> [args...]" >&2; exit 2; }
@@ -487,11 +494,11 @@ else
 fi
 proxy_start() {
   if [ -n "$CANARY_DIR" ]; then
-    exec "$SANDBOXCHECKR" proxy --unix "$SOCK" --ready-file "$READY" --log "$PROXY_LOG" \
+    exec "$SANDBOXCHECKR" proxy --unix "$SOCK" --dns-unix "$PRIVDIR/dns.sock" --ready-file "$READY" --log "$PROXY_LOG" \
       --events "$EVENTS" --agent "$AGENT" --deny-file "$DENY_FILE" --ca-bundle-out "$CA_BUNDLE" \
       --canaries "$CANARY_JSON" --canary-trip-file "$CANARY_TRIP_FILE" --canary-pid-file "$CANARY_PID_FILE" $CANARY_FLAGS $ALLOW >/dev/null
   fi
-  exec "$SANDBOXCHECKR" proxy --unix "$SOCK" --ready-file "$READY" --log "$PROXY_LOG" \
+  exec "$SANDBOXCHECKR" proxy --unix "$SOCK" --dns-unix "$PRIVDIR/dns.sock" --ready-file "$READY" --log "$PROXY_LOG" \
     --events "$EVENTS" --agent "$AGENT" --deny-file "$DENY_FILE" --ca-bundle-out "$CA_BUNDLE" $ALLOW >/dev/null
 }
 proxy_start &
@@ -528,8 +535,14 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 	// finally the fixed arguments that were probed.
 	b.WriteString("\n# The command (and, for the proxied variant, the in-sandbox bridge).\n")
 	if m.proxyPort != 0 {
-		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$PRIV_IN/proxy.sock\" ${BIND_PORTS:+--bind-ports \"$BIND_PORTS\"} -- \"$CMD_PATH\" \"$@\"\n",
+		fmt.Fprintf(&b, "set -- -- \"$SANDBOXCHECKR\" %s --listen 127.0.0.1:%d --to \"$PRIV_IN/proxy.sock\" --dns-sock \"$PRIV_IN/dns.sock\" ${BIND_PORTS:+--bind-ports \"$BIND_PORTS\"} -- \"$CMD_PATH\" \"$@\"\n",
 			BridgeSubcommand, m.proxyPort)
+		// The bridge gets its own network namespace so the DNS relay can bind
+		// port 53 unprivileged; in a fresh namespace it brings the interface
+		// up itself. Skipped where unshare is unavailable or disallowed, which
+		// leaves name resolution unavailable but everything else working.
+		b.WriteString("if command -v unshare >/dev/null 2>&1 && unshare --user --map-root-user --net true 2>/dev/null; then\n")
+		b.WriteString("  set -- unshare --user --map-root-user --net \"$@\"\nfi\n")
 	} else {
 		b.WriteString("set -- -- \"$CMD_PATH\" \"$@\"\n")
 	}
@@ -551,6 +564,21 @@ echo "sandboxcheckr: egress proxy on $SOCK — decisions logged to $PROXY_LOG, e
 		// clobber the child argv, and only for proxied runs (PRIVDIR exists
 		// there alone).
 		b.WriteString("set -- --ro-bind \"$PRIVDIR\" \"$PRIV_IN\" \"$@\"\n")
+		// Put the sandbox resolver's address where the resolver looks.
+		// /etc/resolv.conf is commonly a symlink into /run (systemd-resolved),
+		// and the tmpfs there hides the target, so the bind lands on the path
+		// the symlink points at; a plain file is replaced directly.
+		b.WriteString(`
+RESOLV_TARGET=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
+case "$RESOLV_TARGET" in
+  /run/*)
+    mkdir "$PRIVDIR/resolve"
+    cp "$PRIVDIR/resolv.conf" "$PRIVDIR/resolve/$(basename "$RESOLV_TARGET")"
+    set -- --ro-bind "$PRIVDIR/resolve" "$(dirname "$RESOLV_TARGET")" "$@" ;;
+  *)
+    set -- --ro-bind "$PRIVDIR/resolv.conf" /etc/resolv.conf "$@" ;;
+esac
+`)
 	}
 	b.WriteString("\n# Program directories, bound read-only AFTER the tmpfs over /home so they are not hidden.\n")
 	b.WriteString("for d in \"$(dirname \"$CMD_PATH\")\" \"$(dirname \"$CMD_REAL\")\" \"$(dirname \"$(dirname \"$CMD_REAL\")\")\"; do\n")

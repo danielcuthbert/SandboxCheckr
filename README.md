@@ -31,8 +31,10 @@ sandboxcheckr run -- npm test
 `run` creates a temporary sandbox and a separate egress proxy for that run.
 Claude and Codex can reach their respective model API hosts by default; another
 command starts with no allowed hosts. The proxy logs destinations and refuses
-those you have not allowed. It also plants fake credentials whose attempted use
-it can detect. A canary trip is blocked and makes the command exit nonzero.
+those you have not allowed. Name resolution inside the sandbox goes through the
+proxy too, under the same allow-list. It also plants fake credentials whose
+attempted use it can detect. A canary trip is blocked and makes the command
+exit nonzero.
 
 To see which hosts a command needs, then allow only the ones you choose:
 
