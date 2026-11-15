@@ -1,6 +1,6 @@
 # SandboxCheckr — Threat Model & Attack Catalog
 
-Status: living document · Assessment plan updated 2026-10-29
+THREAT MODEL ALL TEH THINGZ!!!!
 
 This document models the security of the confinement **SandboxCheckr produces**
 (the generated Seatbelt profiles, bubblewrap invocations, and egress proxy), and
@@ -14,9 +14,14 @@ hypotheses, local probes and proposed fixes. Historical test results below
 apply only to their named OS, version and launch path; they must be retested
 against the current `run` command before being treated as current assurance.
 
+If I'm honest, this will continue as a living document as I test and hurt
+and mess with agents and models and tools like this. I'd welcome additions
+from you all too. 
+
+Daniel
 ---
 
-## 1. What we are protecting, and from what
+## 1. What we are protecting, and from what -- sneaky agents who move fast
 
 **Asset:** the host running an untrusted or semi-trusted program (a coding
 agent, an MCP server, a package install script) under a SandboxCheckr-generated
@@ -351,6 +356,69 @@ finding is empirically confirmed or analysis-derived pending a run.
   not reliably measurable, require hardware, or are low-yield relative to the
   noise they would add. Enumerating *every* channel is not a goal — see §5.
 
+### SBX-012 — DNS relay: a query name is an exfil channel to every allow-listed suffix · HIGH (design), 2026-11-15
+
+- **Affects:** every proxied variant with the DNS relay (`--dns-unix`).
+- **Hypothesis:** the relay gates lookups with the same policy as connections
+  (canary, kill switch, allow-list), so a name matching a rule is forwarded to
+  the host resolver — and the **full query name leaves the host**. An agent can
+  encode arbitrary data in subdomain labels of any allowed suffix
+  (`cGF5bG9hZC1leGZpbC0yMDI2.localhost`) and the operator of that suffix sees
+  the bytes. This is the DNS-face of SBX-006/A07 and cannot be closed while
+  suffix rules exist at all.
+- **What holds:** every decision is gate-ordered (canary → deny file →
+  allow-list) and recorded with the full judged name in `events.jsonl`
+  (`kind=dns`), so the channel is fully visible to the console and any log
+  review; refused lookups return REFUSED with no upstream traffic.
+- **Acceptance:** BT-8.3/8.4 — canonicalisation identical across the three
+  gates, boundary matching exact, full name logged per decision.
+- **Mitigation as shipped:** visibility, not prevention. A suffix rule for a
+  third-party domain hands that domain both a data channel and a lookup oracle;
+  say so in policy guidance (as with SBX-006 relay payloads).
+
+### SBX-013 — An allow-listed host can act as a resolver (DoH/DoT/Do53) for arbitrary names · MEDIUM (design), 2026-11-15
+
+- **Affects:** proxied variants; extends SBX-006 from the payload plane to the
+  resolution plane.
+- **Hypothesis:** an agent that may tunnel to any allowed host can run DNS
+  inside that tunnel — DoH over plain HTTP (RFC 8484 permits http), DoT, or a
+  plain forwarder — and resolve names the relay refuses. The proxy sees only a
+  permitted CONNECT.
+- **What holds:** resolution permits nothing. The tunnel's client then has to
+  connect to the resolved address, and the connection gate re-validates the
+  literal it is handed (BT-8.5/8.6): private and unlisted literals are refused
+  per connection. A cooperative in-tunnel resolver cannot open egress.
+- **Residual:** a resolution oracle (is `x.test` registered?) and arbitrary
+  metadata exchange with the allowed host. Same accept as SBX-006: origin
+  quality is the control, per-connection re-validation is the floor.
+
+### SBX-014 — Mapped root in the nested network namespace: packet sniffing and :53 takeover · MEDIUM, 2026-11-15
+
+- **Affects:** Linux proxied variants (bwrap `--unshare-user --map-root-user
+  --net`); the bridge binds 127.0.0.1:53 inside that namespace.
+- **Hypothesis:** the sandboxed process runs as mapped root and therefore holds
+  CAP_NET_RAW *inside* the nested namespace: an AF_PACKET socket on `lo` sees
+  sibling agents' DNS exchanges in the clear. The same-UID process can also
+  kill the bridge process (no pid isolation within the run) and rebind UDP :53
+  with a fake resolver for peers.
+- **What holds:** the connection gate decides on the literal each CONNECT
+  carries, so spoofed answers cannot open egress. The takeover half of the
+  hypothesis is closed by construction: the bridge (`__bridge`) is bwrap's
+  entry process, so a same-UID kill succeeds (no capability check inside the
+  ns) but the namespace dies with it — no post-kill code runs, nothing
+  survives to bind :53, and while the bridge lives the port is bound
+  (EADDRINUSE). Each run has its own netns, so there are no sibling
+  namespaces to spoof (BT-8.11). The sniffing half is confirmed: mapped root
+  does hold CAP_NET_RAW in the nested ns and an AF_PACKET listener on `lo`
+  reads queries and answers in the clear, including between peer processes in
+  one run (BT-8.12, BT-8.19) — a documented capability, mitigated by
+  visibility: every judged query name lands in `events.jsonl` host-side.
+  Killing the relay by killing the proxy also fails closed (BT-8.17).
+- **Status:** VERIFIED 2026-11-15 (BT-8.11/8.12/8.19). Residual: CAP_NET_RAW
+  sniffing inside the nested ns remains possible; hardening options if it
+  ever matters: drop CAP_NET_RAW in the nested ns, or peer-cred-check the
+  relay sockets.
+
 ## 4. Swarm / coordination threats
 
 Individual confinement is not mutual isolation. These concern two or more
@@ -412,6 +480,34 @@ sandboxed processes cooperating.
 
 SWM-006 is the swarm-scale corollary of SBX-001: fix the `mach-lookup` allowlist
 and it closes both the egress vector and a peer channel.
+
+---
+
+### SWM-008 — Covert swarm channel over DNS query names · DETECTED IN PART, 2026-11-15
+
+- **Affects:** multiple agents sharing one sandbox run (same nested network
+  namespace), proxied variants with the DNS relay.
+- **Hypothesis (A19):** the relay's allow-listed suffixes are a message board
+  without any network peer: agent A encodes a note in subdomain labels
+  (`msg-for-B-<n>.<allowed-suffix>`), which leaves as a query. Agent B cannot
+  *read* A's note through the relay (answers come from the host resolver, B
+  sees none of A's traffic) — but B holds CAP_NET_RAW in the namespace
+  (SBX-014), so an AF_PACKET listener on `lo` reads A's queries and answers
+  straight off the wire. Two agents therefore get a covert channel whose
+  payload is a hostname.
+- **What holds:** every query name both agents send lands in `events.jsonl`
+  with the full label sequence, so the console sees the channel's carrier
+  traffic even though neither agent trips any rule (BT-8.12/8.19 — confirmed:
+  a sibling decoded a base64 note off the wire, and the encoded label is in
+  the host-side decision log). The channel
+  is also slow (label size limits, 63 bytes per label) and unidirectional
+  unless B also queries.
+- **Residual:** content-level prevention would require refusing subdomains of
+  allow-listed suffixes or inspecting names — both break legitimate resolution
+  (CDN sharding, observability domains). Same family as SWM-007: the channel
+  is a by-design consequence of the allow-list; visibility is the control.
+- **Acceptance:** BT-8.12 (sniffing works, host-side log parity) and BT-8.19
+  (dead-drop round trip observed by the host, not by the peers' rules).
 
 ---
 
@@ -483,7 +579,10 @@ What it does well: a live, edit-to-block kill switch, adopted here as
 Canary credentials (roadmap §1) add an active signal to proxied runs. Each
 agent gets its own reserved `.invalid` hostnames and token strings. The proxy
 denies and records attempts to reach those hosts before DNS or the allow-list,
-including in observe mode. It also denies visible token strings in request
+including in observe mode. Matching is an exact host lookup: a subdomain of a
+canary host is not tripped (documented residual, BT-8.14 — reachable only if
+that suffix were allow-listed, and canary hosts end `.sandboxcheckr.invalid`).
+It also denies visible token strings in request
 lines, headers and the first 64 KiB of bodies. The runner exits non-zero on a
 trip, and `canary.detection` checks the proxy records a deliberate trip. This
 helps with SBX-006, SBX-011 and SWM-007 when an agent uses planted credentials.

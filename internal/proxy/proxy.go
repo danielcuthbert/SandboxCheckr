@@ -770,6 +770,9 @@ func (s *Server) handleDNS(ctx context.Context, c net.Conn) {
 func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
 	name, qtype, ok := dnsQuestion(query)
 	if !ok {
+		// Judged, but invisible unless it is logged: a query the gate cannot
+		// parse is still traffic the program sent, so record the refusal.
+		s.dnsEvent("", "", events.Deny, "unparseable query")
 		return dnsError(query, dnsRCODEServFail)
 	}
 	name = strings.TrimSuffix(name, ".")
@@ -888,10 +891,21 @@ const (
 // dnsError answers a query with just a response code: the question echoed, no
 // answers, QR set. A refusal or failure is honest with the program — it
 // retries, gives up or reports, exactly as with an unreachable resolver —
-// without inventing a lie like NXDOMAIN.
+// without inventing a lie like NXDOMAIN. When the question cannot be echoed
+// (truncated or malformed wire form) a bare header still goes out: the
+// program gets a real rcode, never an empty datagram.
 func dnsError(query []byte, rcode int) []byte {
+	bare := func() []byte {
+		resp := make([]byte, 12)
+		if len(query) >= 2 {
+			copy(resp, query[:2]) // echo the id so the program can match
+		}
+		resp[2] = 0x80 // QR=1
+		resp[3] = byte(rcode)
+		return resp
+	}
 	if len(query) < 12 {
-		return nil
+		return bare()
 	}
 	end := 12
 	qd := binary.BigEndian.Uint16(query[4:6])
@@ -900,7 +914,7 @@ func dnsError(query []byte, rcode int) []byte {
 		pos := 12
 		for {
 			if pos >= len(query) {
-				return nil
+				return bare()
 			}
 			n := int(query[pos])
 			pos++
@@ -908,12 +922,12 @@ func dnsError(query []byte, rcode int) []byte {
 				break
 			}
 			if n > 63 || pos+n > len(query) {
-				return nil
+				return bare()
 			}
 			pos += n
 		}
 		if pos+4 > len(query) {
-			return nil
+			return bare()
 		}
 		end = pos + 4
 	} else {

@@ -292,10 +292,11 @@ func TestDNSRelayIgnoresGarbage(t *testing.T) {
 	if len(resp) == 0 || resp[3]&0x0F != 2 {
 		t.Fatalf("malformed query: want SERVFAIL, got %v", resp)
 	}
-	// A query shorter than a header gets no response at all: the framing
-	// cannot carry an echo of something that has none.
-	if resp := exchangeDNS(t, c, []byte{0, 0, 0, 0}); len(resp) != 0 {
-		t.Fatalf("short query: want no response, got %v", resp)
+	// A query shorter than a header still gets a bare header: QR set, the
+	// requested rcode, counts zero, no echo of a question that has none. The
+	// program sees a real rcode instead of an empty datagram.
+	if resp := exchangeDNS(t, c, []byte{0, 0, 0, 0}); len(resp) != 12 || resp[2]&0x80 == 0 || resp[3]&0x0F != 2 {
+		t.Fatalf("short query: want bare SERVFAIL header, got %v", resp)
 	}
 }
 
