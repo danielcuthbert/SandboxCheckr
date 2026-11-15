@@ -233,8 +233,14 @@ func TestDetectVenvPrefersActivatedThenProject(t *testing.T) {
 	}
 	t.Setenv("VIRTUAL_ENV", activated)
 	root, _, ok = detectVenv(project)
-	if !ok || root != activated {
-		t.Fatalf("activated venv: root=%q ok=%v", root, ok)
+	// detectVenv resolves the variable through symlinks, which on Windows
+	// also expands 8.3 short names, so compare canonical forms.
+	want, err := filepath.EvalSymlinks(activated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || root != want {
+		t.Fatalf("activated venv: root=%q want=%q ok=%v", root, want, ok)
 	}
 	// A VIRTUAL_ENV without bin/ is ignored.
 	broken := t.TempDir()
@@ -261,6 +267,20 @@ func TestProjectEventsPathIsStableAndDistinct(t *testing.T) {
 	dir := filepath.Base(filepath.Dir(pa))
 	if len(dir) != 8 {
 		t.Fatalf("hash directory %q is not 8 characters", dir)
+	}
+}
+
+// The run hashes the workdir as given, the console hashes the process
+// working directory after EvalSymlinks; on Windows that also rewrites 8.3
+// short names, so a raw path and its canonical form must land on one log.
+func TestProjectEventsPathResolvesSymlinks(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if projectEventsPath(link) != projectEventsPath(real) {
+		t.Fatal("a project behind a symlink must share the real project's log")
 	}
 }
 

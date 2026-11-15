@@ -711,9 +711,17 @@ func sandboxcheckrStateDir() string {
 }
 
 // projectEventsPath is the per-project default event log: a stable short
-// hash of the project's absolute path, so different projects never interleave
-// and the console can find the log again from the same directory.
+// hash of the project's canonical absolute path, so different projects never
+// interleave and the console can find the log again from the same directory.
+// The path is resolved through symlinks before hashing because callers spell
+// the same directory differently: a run takes it from --workdir, the console
+// from the process working directory, and on Windows resolving also expands
+// 8.3 short names, so without this the two sides would hash different
+// strings and the console would not find the run's log.
 func projectEventsPath(project string) string {
+	if real, err := filepath.EvalSymlinks(project); err == nil {
+		project = real
+	}
 	sum := sha256.Sum256([]byte(project))
 	return filepath.Join(sandboxcheckrStateDir(), "projects", hex.EncodeToString(sum[:4]), "events.jsonl")
 }
