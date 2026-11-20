@@ -10,3 +10,6 @@ __pycache__/
 
 # Decision logs from runs before the log moved to a private per-run directory.
 /.sandboxcheckr-proxy.log
+
+# Roadmap stays private: never published to the public repo.
+/ROADMAP.md
