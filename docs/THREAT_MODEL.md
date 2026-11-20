@@ -589,6 +589,27 @@ helps with SBX-006, SBX-011 and SWM-007 when an agent uses planted credentials.
 Unruled HTTPS still hides token strings, ordinary project secrets have no
 canary signal, and a clean canary summary is not evidence of a clean run.
 
+External tokens from an outside token service (a DNS token from
+canarytokens.org) can be supplied with `--canary-token` or the project file's
+`canary-token` key, as a hostname (BT-8.20) or as a `name=value` string
+(BT-8.21). These are not planted: a lookup of the token host is forwarded to
+the real resolver so the token service's own nameserver sees it and its
+alerting works, and a connection to the token host is forwarded the same way,
+because that connection is the protocol exchange most kinds' alerts wait for.
+Both are allowed despite sitting outside the allow-list, and both are fully
+recorded (`reason=external canary token (forwarded)`, trip at high
+confidence). Every other use is refused like a planted canary: the token
+showing up in a request aimed at another host, and a value token (an AWS key
+pair, a card number) appearing anywhere in visible bytes, trip at high
+confidence and are denied. For a value token that denial is the whole
+detection: the vendor email cannot fire, because the value never leaves. The
+forwarding is a deliberate asymmetry: the token's traffic must leave the host
+for the token to work at all, so the token host is reachable from the sandbox
+— the paste is the authorisation, and the deny file still cuts any token host
+off mid-run. A DNS token only fires on resolution: it cannot observe a lookup
+the program never makes, and unruled HTTPS can still carry a token name or a
+token value unseen.
+
 The principle: measurement can silently share the sandbox's assumptions.
 
 | Path | What the probe tests | Current reality (macOS 26.6) |

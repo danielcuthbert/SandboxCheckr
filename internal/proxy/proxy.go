@@ -154,9 +154,9 @@ func (s *Server) trip(c canary.Credential, host, port, method, confidence string
 
 // scanVisible checks request metadata and at most 64 KiB of body. The bytes
 // read for inspection are put back so an allowed request is not changed.
-func (s *Server) scanVisible(req *http.Request, host, port string, client io.Writer) bool {
+func (s *Server) scanVisible(req *http.Request, host, port string, client io.Writer) (canary.Credential, bool) {
 	if s.Canaries == nil {
-		return false
+		return canary.Credential{}, false
 	}
 	m := s.canaryMatcher()
 	var visible bytes.Buffer
@@ -180,14 +180,20 @@ func (s *Server) scanVisible(req *http.Request, host, port string, client io.Wri
 		req.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(b), req.Body), closer: req.Body}
 	}
 	if c, ok := m.Bytes(visible.Bytes()); ok {
+		if c.External && c.Host == host {
+			// A request aimed at the token's own host is the token's
+			// intended use, not a leak of it: leave it to the connect gate,
+			// which forwards it.
+			return c, false
+		}
 		confidence := "high"
-		if c.Host == host {
+		if c.Host == host && !c.External {
 			confidence = "medium"
 		}
 		s.trip(c, host, port, req.Method, confidence)
-		return true
+		return c, true
 	}
-	return false
+	return canary.Credential{}, false
 }
 
 type replayBody struct {
@@ -385,17 +391,10 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 	s.handlePlain(ctx, client, req)
 }
 
-// decide applies the allow-list and the address guard, returning the upstream
-// address to dial.
+// decide applies the canary gate, the allow-list and the address guard,
+// returning the upstream address to dial.
 func (s *Server) decide(host, port, method string) (string, bool) {
 	s.count(host, port, func(st *Stat) { st.Conns++ })
-	if s.Canaries != nil {
-		if c, ok := s.canaryMatcher().Host(host); ok {
-			s.trip(c, host, port, method, "medium")
-			s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: "canary credential"})
-			return "", false
-		}
-	}
 	note := ""
 	if k := RelayKind(host); k != "" {
 		note = "  [can store/forward: " + k + "]"
@@ -412,7 +411,33 @@ func (s *Server) decide(host, port, method string) (string, bool) {
 		s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: why})
 		return "", false
 	}
-
+	forward := false
+	if s.Canaries != nil {
+		if c, ok := s.canaryMatcher().Host(host); ok {
+			if c.External {
+				// A connection to the token's own host is the token's
+				// intended use, not a leak of it, so forward it and let the
+				// token service alert. The trip is recorded either way.
+				forward = true
+				s.trip(c, host, port, method, "high")
+				s.logf("ALLOW %s:%s  [external canary token]", host, port)
+				s.event(events.Event{Kind: events.KindConnect, Decision: events.Allow, Host: host, Port: port, Reason: "external canary token (forwarded)"})
+			} else {
+				s.trip(c, host, port, method, "medium")
+				s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: "canary credential"})
+				return "", false
+			}
+		}
+	}
+	if forward {
+		// The deny file beats a forwarded token, as it does in the DNS relay.
+		if entry, hit := s.Deny.Match(host); hit {
+			return deny("in deny file (" + entry + ")")
+		}
+		// Dialled by name: the token host is outside the allow-list, so its
+		// addresses were never checked against the private-address guard.
+		return net.JoinHostPort(host, port), true
+	}
 	// The kill switch comes first and holds in observe mode too: it exists to
 	// take access away, so nothing else may give it back.
 	if entry, hit := s.Deny.Match(host); hit {
@@ -494,9 +519,13 @@ func (s *Server) handleConnect(ctx context.Context, client net.Conn, req *http.R
 		writeStatus(client, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.scanVisible(req, host, port, client) {
+	if c, ok := s.scanVisible(req, host, port, client); ok {
 		s.count(host, port, func(st *Stat) { st.Conns++ })
-		s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: "canary credential"})
+		reason := "canary credential"
+		if c.External {
+			reason = "external canary token"
+		}
+		s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: reason})
 		writeStatus(client, http.StatusForbidden, "SandboxCheckr proxy: canary credential tripped")
 		return
 	}
@@ -575,9 +604,13 @@ func (s *Server) inspect(ctx context.Context, client net.Conn, host, port, upstr
 			return
 		}
 		s.count(host, port, func(st *Stat) { st.Methods[req.Method]++ })
-		if s.scanVisible(req, host, port, tlsClient) {
+		if c, ok := s.scanVisible(req, host, port, tlsClient); ok {
+			reason := "canary credential"
+			if c.External {
+				reason = "external canary token"
+			}
 			s.event(events.Event{Kind: events.KindRequest, Decision: events.Deny, Host: host, Port: port,
-				Method: req.Method, Reason: "canary credential"})
+				Method: req.Method, Reason: reason})
 			writeStatus(tlsClient, http.StatusForbidden, "SandboxCheckr proxy: canary credential tripped")
 			return
 		}
@@ -631,9 +664,13 @@ func (s *Server) handlePlain(ctx context.Context, client net.Conn, req *http.Req
 		return
 	}
 
-	if s.scanVisible(req, host, port, client) {
+	if c, ok := s.scanVisible(req, host, port, client); ok {
 		s.count(host, port, func(st *Stat) { st.Conns++; st.Methods[req.Method]++ })
-		s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: "canary credential"})
+		reason := "canary credential"
+		if c.External {
+			reason = "external canary token"
+		}
+		s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: reason})
 		writeStatus(client, http.StatusForbidden, "SandboxCheckr proxy: canary credential tripped")
 		return
 	}
@@ -776,11 +813,21 @@ func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
 		return dnsError(query, dnsRCODEServFail)
 	}
 	name = strings.TrimSuffix(name, ".")
+	forward := false
 	if s.Canaries != nil {
 		if c, ok := s.canaryMatcher().Host(name); ok {
-			s.trip(c, name, "53", "DNS", "medium")
-			s.dnsEvent(name, qtype, events.Deny, "canary credential")
-			return dnsError(query, dnsRCODERefused)
+			if c.External {
+				// An external token only alerts when the lookup reaches the
+				// token service's own nameserver, so forward the query and
+				// answer normally. The trip is recorded either way.
+				forward = true
+				s.trip(c, name, "53", "DNS", "high")
+				s.dnsEvent(name, qtype, events.Allow, "external canary token (forwarded)")
+			} else {
+				s.trip(c, name, "53", "DNS", "medium")
+				s.dnsEvent(name, qtype, events.Deny, "canary credential")
+				return dnsError(query, dnsRCODERefused)
+			}
 		}
 	}
 	if s.Deny != nil {
@@ -790,7 +837,7 @@ func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
 		}
 	}
 	observe := false
-	if !s.Allow.PermitsHost(name) {
+	if !forward && !s.Allow.PermitsHost(name) {
 		if !s.Observe {
 			s.dnsEvent(name, qtype, events.Deny, "not in allow-list")
 			return dnsError(query, dnsRCODERefused)
@@ -806,6 +853,8 @@ func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
 	if observe {
 		s.logf("DNS   %s (%s)  (would be DENIED when enforcing)", name, qtype)
 		s.dnsEvent(name, qtype, events.Observe, "not in allow-list")
+	} else if forward {
+		s.logf("DNS   %s (%s)  (external canary token)", name, qtype)
 	} else {
 		s.logf("DNS   %s (%s)", name, qtype)
 		s.dnsEvent(name, qtype, events.Allow, "")

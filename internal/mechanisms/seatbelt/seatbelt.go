@@ -836,7 +836,7 @@ else
   CANARY_TRIP_FILE="$CANARY_DIR/tripped"
   CANARY_PID_FILE="$CANARY_DIR/child.pid"
   "$SANDBOXCHECKR" canary new --file "$CANARY_JSON" --dir "$CANARY_DATA" --mount "$CANARY_DATA" \
-    --pass-env "$PASS_ENV" --extra "$EXTRA_RO $EXTRA_RW"
+    --pass-env "$PASS_ENV" --extra "$EXTRA_RO $EXTRA_RW" ${CANARY_TOKENS_FLAGS:-}
   grant "file-read* file-test-existence" "$CANARY_DATA"
   if [ "${CANARY_KILL:-0}" = 1 ]; then CANARY_FLAGS="--canary-kill"; fi
 fi

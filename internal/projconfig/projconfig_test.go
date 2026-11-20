@@ -31,6 +31,7 @@ rule = ["github.com:GET,HEAD:/danielcuthbert/"]
 allow-port = [8000, 11434]
 allow-private-host = ["localhost"]
 pass-env = ["ANTHROPIC_API_KEY"]
+canary-token = ["abc123.tokenexample.com"]
 ro = ["~/tools/raptor"]
 rw = ["~/out"]
 observe = false
@@ -71,6 +72,9 @@ deny-file = "~/deny.txt"
 	}
 	if cfg.Agent != "raptor" || cfg.DenyFile != filepath.Join(home, "deny.txt") {
 		t.Fatalf("agent/deny: %q %q", cfg.Agent, cfg.DenyFile)
+	}
+	if len(cfg.CanaryTokens) != 1 || cfg.CanaryTokens[0] != "abc123.tokenexample.com" {
+		t.Fatalf("canary-token: %q", cfg.CanaryTokens)
 	}
 }
 

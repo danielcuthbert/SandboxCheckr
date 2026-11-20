@@ -27,6 +27,7 @@ import (
 type Config struct {
 	Allows, Rules, Ports, PrivHosts []string
 	PassEnv, RO, RW                 []string
+	CanaryTokens                    []string
 	Observe                         bool
 	NoCanary, CanaryKill            bool
 	NoAgentAuth                     bool
@@ -62,6 +63,7 @@ var specs = map[string]keySpec{
 	"allow-port":         stringsKey(func(c *Config, v []string) { c.Ports = v }),
 	"allow-private-host": stringsKey(func(c *Config, v []string) { c.PrivHosts = v }),
 	"pass-env":           stringsKey(func(c *Config, v []string) { c.PassEnv = v }),
+	"canary-token":       stringsKey(func(c *Config, v []string) { c.CanaryTokens = v }),
 	"ro":                 pathsKey(func(c *Config, v []string) { c.RO = v }),
 	"rw":                 pathsKey(func(c *Config, v []string) { c.RW = v }),
 	"observe":            boolKey(func(c *Config, v bool) { c.Observe = v }),

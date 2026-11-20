@@ -33,7 +33,10 @@ Claude and Codex can reach their respective model API hosts by default; another
 command starts with no allowed hosts. The proxy logs destinations and refuses
 those you have not allowed. Name resolution inside the sandbox goes through the
 proxy too, under the same allow-list. It also plants fake credentials whose
-attempted use it can detect. A canary trip is blocked and makes the command
+attempted use it can detect, and can carry a token from an outside token
+service such as canarytokens.org: a hostname whose lookups and connections
+are forwarded so the token service can alert you, or a `name=value` string
+whose visible use is denied. A canary trip is blocked and makes the command
 exit nonzero.
 
 To see which hosts a command needs, then allow only the ones you choose:

@@ -40,6 +40,8 @@ func runCanary(args []string) int {
 	mount := fs.String("mount", "", "path visible inside the sandbox")
 	pass := fs.String("pass-env", "", "passed environment names")
 	extra := fs.String("extra", "", "extra exposed paths")
+	tokens := multiFlag{}
+	fs.Var(&tokens, "token", "external canary token `host`, or `name=value` to watch a string (e.g. from canarytokens.org); repeatable")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -52,6 +54,9 @@ func runCanary(args []string) int {
 			return 2
 		}
 		s, err := canary.New(*pass, *extra, *mount)
+		if err == nil {
+			err = s.AddExternal(tokens)
+		}
 		if err == nil {
 			err = s.Plant(*dir)
 		}
@@ -66,6 +71,9 @@ func runCanary(args []string) int {
 			fmt.Fprintln(os.Stderr, "sandboxcheckr: all canary groups skipped because real credentials or config paths were passed")
 		} else {
 			fmt.Fprintln(os.Stderr, "sandboxcheckr: canaries active, run "+s.RunID)
+		}
+		if n := countExternal(s); n > 0 {
+			fmt.Fprintf(os.Stderr, "sandboxcheckr: external canary tokens: %d (lookups of the token host and connections to it are forwarded so the token service alerts; every use trips at high confidence)\n", n)
 		}
 		return 0
 	case "env":
@@ -90,4 +98,14 @@ func runCanary(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: sandboxcheckr canary new|env ...")
 		return 2
 	}
+}
+
+func countExternal(s *canary.Set) int {
+	n := 0
+	for _, c := range s.Credentials {
+		if c.External {
+			n++
+		}
+	}
+	return n
 }

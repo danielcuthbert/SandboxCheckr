@@ -36,7 +36,11 @@ and the egress proxy are on by default. Canaries use unique .invalid hosts
 and fake tokens in private scratch, never your project or real home. Any trip
 is denied, logged, printed at exit, and returns status 3. --observe still
 denies canary trips. --canary-kill stops the command on a high-confidence
-trip; --no-canary disables planting. No trip does not prove the run was
+trip; --no-canary disables planting. --canary-token adds a token from an
+outside token service (for example a DNS token from canarytokens.org), as a
+hostname or as name=value to watch a string: lookups of the token host and
+connections to it are forwarded so the token service can alert you, and every
+use of the token trips at high confidence. No trip does not prove the run was
 clean: unruled HTTPS hides token strings.
 
 Examples:
@@ -121,6 +125,7 @@ const pathHelp = `The command is looked up in this shell's PATH, as it would be 
 // policy regardless of where each value came from.
 type runOptions struct {
 	allows, rules, ports, privHosts, passes, ro, rw multiFlag
+	canaryTokens                                    multiFlag
 	observe, canaryKill, noCanary, noAgentAuth      bool
 	events, agent, denyFile                         string
 }
@@ -144,6 +149,7 @@ func runSandbox(args []string) int {
 	fs.StringVar(&o.denyFile, "deny-file", "", "live kill-switch `file`: hosts listed here are cut off mid-run")
 	fs.BoolVar(&o.canaryKill, "canary-kill", false, "stop the command on a high-confidence canary trip")
 	fs.BoolVar(&o.noCanary, "no-canary", false, "disable canary credentials (the proxy prints this)")
+	fs.Var(&o.canaryTokens, "canary-token", "external canary token `host` (a DNS token from canarytokens.org) or `name=value` to watch a string; repeatable. Lookups of the token host and connections to it are forwarded so the token service alerts, and every use trips at high confidence")
 	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -441,6 +447,13 @@ func runSandbox(args []string) int {
 	if o.noCanary {
 		env = replaceEnv(env, "CANARY", "0")
 	}
+	if len(o.canaryTokens) > 0 {
+		flags := make([]string, 0, 2*len(o.canaryTokens))
+		for _, h := range o.canaryTokens {
+			flags = append(flags, "--token", h)
+		}
+		env = replaceEnv(env, "CANARY_TOKENS_FLAGS", strings.Join(flags, " "))
+	}
 	if o.observe {
 		env = replaceEnv(env, "ALLOW", "--observe")
 	} else {
@@ -641,6 +654,7 @@ func mergeProjectConfig(cfg *projconfig.Config, set map[string]bool, o *runOptio
 	o.ports = unique(append(append([]string{}, cfg.Ports...), o.ports...))
 	o.privHosts = unique(append(append([]string{}, cfg.PrivHosts...), o.privHosts...))
 	o.passes = unique(append(append([]string{}, cfg.PassEnv...), o.passes...))
+	o.canaryTokens = unique(append(append([]string{}, cfg.CanaryTokens...), o.canaryTokens...))
 	o.ro = unique(append(append([]string{}, cfg.RO...), o.ro...))
 	o.rw = unique(append(append([]string{}, cfg.RW...), o.rw...))
 	if !set["observe"] {

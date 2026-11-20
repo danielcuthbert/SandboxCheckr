@@ -173,7 +173,9 @@ A proxied sandbox resolves names too. Its resolver points at a relay on the
 sandbox's own loopback, which hands each lookup to the proxy over a unix
 socket; the proxy gates the name against the same policy as a connection —
 canary hosts, the kill switch, the allow-list — and only then resolves it on
-the host, where the resolver actually lives. The sandbox never sees your
+the host, where the resolver actually lives. One exception: a lookup of an
+external canary token (`--canary-token`) is forwarded rather than refused, so
+the token service's nameserver sees it; see the canary section. The sandbox never sees your
 resolver or a route to it, and no UDP leaves the namespace.
 
 A lookup is a signal as well as a prerequisite: a query name can carry data,
@@ -245,8 +247,8 @@ sandboxcheckr run -- omp -c
 ```
 
 The file accepts `allow`, `rule`, `allow-port`, `allow-private-host`,
-`pass-env`, `ro`, `rw`, `events`, `agent`, `deny-file`, and the switches
-`observe`, `no-canary`, `canary-kill`, `no-agent-auth` — one `key = value`
+`pass-env`, `canary-token`, `ro`, `rw`, `events`, `agent`, `deny-file`, and the
+switches `observe`, `no-canary`, `canary-kill`, `no-agent-auth` — one `key = value`
 per line, strings in quotes, lists in square brackets, `#` comments. It is a
 strict subset of TOML on purpose: an unknown key, a misspelt name or a wrong
 type is an error naming the line, never a silent default. List flags add to
@@ -451,6 +453,64 @@ bubblewrap exposes them read-only
 and substitutes a canary for existing project `.env` files. Seatbelt keeps its
 `.env` access denial and cannot substitute file content.
 
+**External canary tokens.** You can also pass tokens from an outside token
+service (a DNS token from canarytokens.org, for example) with `--canary-token`:
+a hostname, or `name=value` to watch a string; repeatable, or the project
+file's `canary-token` key. Nothing about
+these is planted in the sandbox: a hostname's whole value is that a lookup of
+it reaches the token service's own nameserver and alerts you there; a value
+token's whole value is the string itself. The relay
+therefore forwards a lookup of such a host and answers it normally, while
+recording a **high**-confidence trip: the token service emails you, and the
+exit summary and event log both show the trip, so `--canary-kill` stops the
+command on it. A connection to the token host itself is the token's intended
+use, so it is forwarded too: the token service sees the protocol exchange its
+alert waits for, and the trip is still recorded at high confidence. What is
+refused is the token showing up somewhere else: the name appearing in a
+request line or body aimed at another host trips at high confidence and is
+blocked, as it is for a planted canary. `--no-canary` disables external
+tokens along with the planted ones, and the deny file cuts a token off mid-run
+like any other host.
+
+To use one: create the token on canarytokens.org (a DNS token from
+https://canarytokens.org/nest/create/dns, or any kind that hands you a
+hostname, such as https://canarytokens.org/nest/create/sql-server), give it a
+memo you will recognise (`agent on sparky`, say), and paste the hostname it
+shows you into the run:
+
+```sh
+sandboxcheckr run --canary-token abc123xyz.canarytokens.com -- claude
+```
+
+or into the project file, so every run in that project carries it:
+
+```toml
+# sandboxcheckr.toml
+canary-token = ["abc123xyz.canarytokens.com"]
+```
+
+If anything in the sandbox resolves that name (an agent fetching a URL it was
+handed, or resolving a name straight out of a prompt, for instance), Thinkst
+emails you within seconds and the run's exit summary shows a CANARY section
+naming the token. The hostname is the same in every run that carries it, so
+the email tells you the token tripped, not which run tripped it: create one
+token per project, or one per agent, if you want to tell them apart. A DNS
+token (and a log4shell token) alerts on the lookup itself, so a pasted
+hostname gets you the Thinkst email as well as the trip. Kinds whose alert
+needs their protocol to reach the token service (a SQL Server, MySQL,
+kubeconfig or web bug token, say) get it too: the connection that carries the
+protocol is forwarded, so the vendor email fires and the trip is recorded.
+
+Some kinds hand you a string instead of a hostname: an AWS key pair, a card
+number. Pass those as `name=value` (`--canary-token 'aws-keys=AKIA...'`),
+repeatable, or as a `canary-token` project entry. There is nothing to forward:
+the token is the string, so SandboxCheckr watches for it in request lines and
+bodies and denies its use at high confidence. That local trip is the
+detection: the token service's email cannot fire, because the value never
+leaves the sandbox. Spaces and dashes are removed from a value (card numbers
+are written both ways) and what remains must be plain token characters,
+because the value travels through the runner's shell.
+
 The `canary.detection` probe verifies that a confined child can trigger a
 recorded proxy trip. No trip during an agent run does not mean it was clean:
 unruled HTTPS hides token strings, only the first 64 KiB of visible request
@@ -618,6 +678,7 @@ sandboxcheckr run claude                 # one command, current project, proxied
 sandboxcheckr run --workdir /path/to/project claude
 sandboxcheckr run --allow registry.npmjs.org -- npm install
 sandboxcheckr run --observe claude       # discover hosts; canary trips stay blocked
+sandboxcheckr run --canary-token abc123.canarytokens.com -- claude   # forward a token host's lookups and connections; trip on any use
 # A sandboxcheckr.toml in the project is the baseline; flags add to or override it.
 # Python venvs (VIRTUAL_ENV, .venv, venv) are granted read-only and put first on PATH.
 # Event logs are per project; console in the same project reads that project's log.

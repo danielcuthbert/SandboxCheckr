@@ -18,6 +18,11 @@ type Credential struct {
 	Label string `json:"label"`
 	Host  string `json:"host"`
 	Value string `json:"value"`
+	// External marks a hostname from an outside token service (for example
+	// canarytokens.org) rather than a planted fake. Nothing about it is
+	// written into the sandbox: it trips when the program looks the name up
+	// or sends it somewhere, which is the token's intended use.
+	External bool `json:"external,omitempty"`
 }
 
 type Set struct {
@@ -115,6 +120,81 @@ func New(passEnv, extra, mount string) (*Set, error) {
 	return s, nil
 }
 
+// AddExternal appends external tokens to the set: a hostname from an outside
+// token service, or name=value to watch a string (an AWS key pair, a card
+// number) whose use shows up in request bytes. Hostnames are trimmed,
+// lowercased and deduplicated against everything already present. They must
+// look like public DNS names: a token only alerts when its lookup reaches the
+// token service's own nameserver, so a bare label or a name with whitespace
+// or path characters cannot work. Values are deduplicated by the string
+// itself.
+func (s *Set) AddExternal(tokens []string) error {
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			return fmt.Errorf("empty canary token")
+		}
+		if name, value, ok := strings.Cut(t, "="); ok {
+			if err := s.addExternalValue(name, value); err != nil {
+				return err
+			}
+			continue
+		}
+		h := strings.ToLower(strings.TrimSuffix(t, "."))
+		if strings.ContainsAny(h, " \t\r\n/\\") || !strings.Contains(h, ".") {
+			return fmt.Errorf("%q does not look like a canary token hostname", h)
+		}
+		dup := false
+		for _, c := range s.Credentials {
+			if c.Host == h {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		s.Credentials = append(s.Credentials, Credential{Label: "external canarytoken", Host: h, Value: h, External: true})
+	}
+	return nil
+}
+
+// addExternalValue adds a value token. Spaces and dashes are removed (card
+// numbers are written both ways) and what remains must be plain token
+// characters: the value reaches the runner through a shell expansion, so a
+// shell metacharacter in it would be code, not data.
+func (s *Set) addExternalValue(name, value string) error {
+	name = strings.TrimSpace(name)
+	value = strings.Map(func(r rune) rune {
+		if r == ' ' || r == '-' || r == '\t' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value))
+	if name == "" || value == "" {
+		return fmt.Errorf("a value canary token needs a name and a value (name=value)")
+	}
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+			b == '.' || b == '_' || b == '~' || b == '+' || b == '/' || b == '=' || b == ':' || b == '@' || b == '#' {
+			continue
+		}
+		return fmt.Errorf("canary token value %q carries a character a token value cannot", value)
+	}
+	for _, c := range s.Credentials {
+		if c.External && c.Host == "" && c.Value == value {
+			return nil
+		}
+	}
+	label := "external canarytoken"
+	if name != "" {
+		label = "external canarytoken (" + name + ")"
+	}
+	s.Credentials = append(s.Credentials, Credential{Label: label, Host: "", Value: value, External: true})
+	return nil
+}
+
 func (s *Set) Credential(label string) *Credential {
 	for i := range s.Credentials {
 		if s.Credentials[i].Label == label {
@@ -158,6 +238,19 @@ func Read(path string) (*Set, error) {
 		return nil, fmt.Errorf("invalid canary run ID")
 	}
 	for _, c := range s.Credentials {
+		if c.External {
+			if c.Host == "" {
+				// A value token: the watched string itself, no hostname.
+				if c.Value == "" || !strings.Contains(c.Label, "canarytoken") {
+					return nil, fmt.Errorf("invalid external canary token")
+				}
+				continue
+			}
+			if !safeName(c.Host) || c.Value != c.Host || !strings.Contains(c.Label, "canarytoken") {
+				return nil, fmt.Errorf("invalid external canary token")
+			}
+			continue
+		}
 		if !strings.HasSuffix(c.Host, "-"+s.RunID+".sandboxcheckr.invalid") ||
 			!safeName(c.Host) || !safeName(c.Label) || !strings.HasPrefix(c.Value, "sbc_") || len(c.Value) != 52 {
 			return nil, fmt.Errorf("invalid canary credential")
@@ -204,7 +297,10 @@ type watchedString struct {
 func NewMatcher(s *Set) *Matcher {
 	m := &Matcher{hosts: map[string]Credential{}}
 	for _, c := range s.Credentials {
-		m.hosts[c.Host] = c
+		if c.Host != "" {
+			// Value tokens have no host; their use is matched in bytes.
+			m.hosts[c.Host] = c
+		}
 		m.strings = append(m.strings, watchedString{[]byte(c.Value), c})
 		if c.Label == "cloud" && s.Env["AWS_ACCESS_KEY_ID"] != "" {
 			m.strings = append(m.strings, watchedString{[]byte(s.Env["AWS_ACCESS_KEY_ID"]), c})
