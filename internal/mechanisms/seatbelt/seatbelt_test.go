@@ -160,7 +160,7 @@ func TestRunnerGrantsIoctlOnInheritedTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`/bin/readlink "/dev/fd/$_fd"`, `(allow file-ioctl (literal $(sbpl_str "$_dev")))`, `$PROFILE_TEXT$EXTRA$PROTECT$TTYEXTRA`} {
+	for _, want := range []string{`add_tty "$(tty 2>/dev/null || true)"`, `(allow file-ioctl (literal $(sbpl_str "$1")))`, `$PROFILE_TEXT$EXTRA$PROTECT$TTYEXTRA`} {
 		if !strings.Contains(art.FileBody, want) {
 			t.Errorf("runner must grant ioctl on the inherited terminal, missing %q", want)
 		}

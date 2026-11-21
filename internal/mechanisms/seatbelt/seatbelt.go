@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
@@ -235,25 +236,66 @@ func verifyGeneratedProfile(ctx context.Context, sandboxExec string, network boo
 //
 // Seatbelt matches the path carried on the vnode, so a rule for /dev/tty does
 // not cover the already-open /dev/ttys003 the child inherits, while a rule for
-// /dev/ttys* would cover every other terminal this user has open. Resolving the
-// three descriptors we actually hand the child is what makes the grant mean
-// "the terminal this run is on" and nothing else.
+// /dev/ttys* would cover every other terminal this user has open. The grant has
+// to name the real node, so the device numbers of the three descriptors handed
+// to the child are matched against the named nodes in /dev.
 //
-// /dev/fd/N and /dev/stdin & friends are symlinks to the device on macOS, which
-// is how tty(1) works. Anything that does not resolve to a terminal character
-// device is dropped, so a run with its output redirected adds no rule at all.
+// Reading /dev/fd/N or /dev/stdin is not an option here: on macOS those are
+// device files of their own (FD(4)) rather than symlinks to the real device, so
+// there is nothing to resolve. A run with its output redirected matches no node
+// and adds no rule at all.
 func inheritedTerminals() []string {
+	wanted := map[uint64]bool{}
+	for _, f := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
+		if rdev := deviceOf(f); rdev != 0 {
+			wanted[rdev] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	entries, err := os.ReadDir("/dev")
+	if err != nil {
+		return nil
+	}
 	var out []string
-	seen := map[string]bool{}
-	for _, p := range []string{"/dev/fd/0", "/dev/fd/1", "/dev/fd/2", "/dev/stdin", "/dev/stdout", "/dev/stderr"} {
-		real, err := filepath.EvalSymlinks(p)
-		if err != nil || seen[real] || !isTtyDevice(real) {
+	for _, e := range entries {
+		// ReadDir gives the entries in name order, so the profile is stable.
+		name := "/dev/" + e.Name()
+		if !isTtyDevice(name) {
 			continue
 		}
-		seen[real] = true
-		out = append(out, real)
+		if rdev := deviceOfPath(name); rdev != 0 && wanted[rdev] {
+			out = append(out, name)
+		}
 	}
 	return out
+}
+
+// deviceOf returns the device number behind an open file, or 0 if it is not a
+// character device. A terminal always has a non-zero number.
+func deviceOf(f *os.File) uint64 {
+	st, err := f.Stat()
+	if err != nil || st.Mode()&os.ModeCharDevice == 0 {
+		return 0
+	}
+	return rdevOf(st)
+}
+
+// deviceOfPath is deviceOf for a path.
+func deviceOfPath(path string) uint64 {
+	st, err := os.Stat(path)
+	if err != nil || st.Mode()&os.ModeCharDevice == 0 {
+		return 0
+	}
+	return rdevOf(st)
+}
+
+func rdevOf(st os.FileInfo) uint64 {
+	if sb, ok := st.Sys().(*syscall.Stat_t); ok {
+		return uint64(sb.Rdev)
+	}
+	return 0
 }
 
 // isTtyDevice reports whether path is a terminal device sitting directly under
@@ -882,19 +924,26 @@ shift
 set -- "$CMD_PATH" "$@"
 # Changing the terminal's mode is its own Seatbelt operation, separate from
 # file-read* and file-write*, so a TUI needs an ioctl grant on the terminal this
-# run inherited or it dies with EPERM before drawing. Resolve the descriptors we
-# hand the child: /dev/ttys* would also cover the user's other terminals, which
-# are shells this sandbox does not own.
+# run inherited or it dies with EPERM before drawing. Name the real node:
+# Seatbelt matches the path on the vnode, so /dev/tty is not enough, and
+# /dev/ttys* would cover the user's other terminals, which are shells this
+# sandbox does not own. tty(1) is the portable way to ask what a descriptor is;
+# /dev/fd/N cannot be readlink'd here, being a device file of its own on macOS.
 TTYEXTRA=""
 SEEN=""
-for _fd in 0 1 2; do
-  _dev=$(/bin/readlink "/dev/fd/$_fd" 2>/dev/null || true)
-  case "$_dev" in /dev/tty*) ;; *) continue ;; esac
-  case " $SEEN " in *" $_dev "*) continue ;; esac
-  SEEN="$SEEN $_dev"
+add_tty() { # add_tty <device path>
+  case "$1" in
+    /dev/tty*) ;;
+    *) return 0 ;;
+  esac
+  case " $SEEN " in *" $1 "*) return 0 ;; esac
+  SEEN="$SEEN $1"
   TTYEXTRA="$TTYEXTRA
-(allow file-ioctl (literal $(sbpl_str "$_dev")))"
-done
+(allow file-ioctl (literal $(sbpl_str "$1")))"
+}
+add_tty "$(tty 2>/dev/null || true)"
+add_tty "$(tty <&1 2>/dev/null || true)"
+add_tty "$(tty <&2 2>/dev/null || true)"
 set -- /usr/bin/sandbox-exec -p "$PROFILE_TEXT$EXTRA$PROTECT$TTYEXTRA" "$@"
 for name in $PASS_ENV; do
   eval "val=\${$name-}"
