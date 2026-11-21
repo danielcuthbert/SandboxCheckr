@@ -337,6 +337,7 @@ EXAMPLES
   sandboxcheckr run --allow registry.npmjs.org -- npm install
   sandboxcheckr --tcc                                     also check Desktop/Documents/Downloads (macOS)
   sandboxcheckr run --canary-kill claude                  stop on a high-confidence trip
+  sandboxcheckr run codex --no-daemon                     Codex without its shared app-server socket
   sandboxcheckr console canaries                          review trips across agents
 
 EMITTED RUNNERS (ADVANCED)

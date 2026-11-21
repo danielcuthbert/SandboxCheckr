@@ -160,7 +160,7 @@ program that ignores the proxy gets no network at all.
 
 | | Default | Change with |
 |---|---|---|
-| Hosts | `api.anthropic.com` for Claude; `api.openai.com` for Codex; any other command starts with **none** — `run` passes `--deny-all`, so every destination is refused until you name one | `run --allow host` (`.github.com` = domain and subdomains) |
+| Hosts | `api.anthropic.com` for Claude; `api.openai.com` for Codex, plus `ab.chatgpt.com` when you sign in to Codex with a ChatGPT plan rather than an API key; any other command starts with **none** — `run` passes `--deny-all`, so every destination is refused until you name one | `run --allow host` (`.github.com` = domain and subdomains) |
 | Ports | 443 and 80 | `--allow-port N` (applies to every allowed host) |
 | Private addresses | refused, incl. cloud metadata — checked on every resolved IP | `--allow-private-host host` for one internal host; link-local stays refused |
 | What you can do on a host | anything | `--rule host:METHODS[:/path,…]` — e.g. `registry.corp:GET,HEAD` |
@@ -197,8 +197,26 @@ sandboxcheckr run --allow burpbountylab.com --allow-port 80 -- ./bin/raptor web 
 The relay binds port 53, which needs a network namespace of its own; the
 runner uses `unshare` (util-linux) for it and the bridge brings the loopback
 up inside. Where `unshare` is unavailable or disallowed, name resolution is
-unavailable and everything else still works: lookups fail the way they do
-with no resolver at all.
+unavailable and everything else still works: lookups fail the way they do with
+no resolver at all.
+
+**Unix sockets**
+
+A unix socket is refused on macOS. Seatbelt files AF_UNIX under
+`network-outbound`, so the profile's `(deny network*)` closes it along with the
+internet, and a `connect()` to a socket file is refused even when the file sits
+in a directory the program may read and write. The Linux runner gives the
+program a fresh `/tmp`, so the host's socket files are not in front of it
+either. Both are deliberate: a socket in a shared directory is a channel to
+whichever process owns it, and one under an agent's own home directory is a
+channel to whatever you run there, sandboxed or not. `sandboxcheckr --peers`
+measures this as the `unix.socket` probe.
+
+What it costs is any program that talks to a background server through a fixed
+socket path, which then needs that server switched off. Codex is the one that
+comes up most: its app-server daemon listens on
+`~/.codex/app-server-control/app-server-control.sock` and gives up at startup
+when the connect is refused, so run it as `sandboxcheckr run codex --no-daemon`.
 
 **Use it**
 
