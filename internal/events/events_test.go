@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -54,4 +55,73 @@ func TestReadSkipsJunk(t *testing.T) {
 func TestNilWriterIsSafe(t *testing.T) {
 	var w *Writer
 	w.Write(Event{Kind: KindConnect})
+}
+
+// A Writer that fails every write, standing in for the disk that fills up
+// mid-run.
+type failWriter struct{ err error }
+
+func (f failWriter) Write(p []byte) (int, error) { return 0, f.err }
+
+// The event log is what questions get asked of afterwards. Losing it to
+// ENOSPC in silence is the failure this guards.
+func TestWriteFailuresAreCounted(t *testing.T) {
+	var log bytes.Buffer
+	w := NewWriter(failWriter{errors.New("no space left on device")}, "a")
+	w.Log = &log
+	for range 3 {
+		w.Write(Event{Kind: KindConnect, Host: "x.test"})
+	}
+	if got := w.Dropped(); got != 3 {
+		t.Errorf("Dropped = %d, want 3", got)
+	}
+	if n := strings.Count(log.String(), "\n"); n != 1 {
+		t.Errorf("first failure should log one line, got %d: %q", n, log.String())
+	}
+	if !strings.Contains(log.String(), "no space left on device") {
+		t.Errorf("the log line should name the error: %q", log.String())
+	}
+
+	var good bytes.Buffer
+	w2 := NewWriter(&good, "a")
+	w2.Log = &log
+	w2.Write(Event{Kind: KindConnect, Host: "x.test"})
+	if w2.Dropped() != 0 {
+		t.Errorf("a successful write counted as dropped: %d", w2.Dropped())
+	}
+	if n := strings.Count(log.String(), "\n"); n != 1 {
+		t.Errorf("a working writer should log nothing, log is %q", log.String())
+	}
+	var nilW *Writer
+	if nilW.Dropped() != 0 {
+		t.Error("a nil writer has dropped nothing")
+	}
+}
+
+// One line past the cap must cost that line and nothing else: a Scanner stops
+// at ErrTooLong, and every event after it went missing without the skipped
+// count the console prints ever moving.
+func TestReadSurvivesOversizedLine(t *testing.T) {
+	long := strings.Repeat("x", MaxLine+1)
+	in := `{"kind":"connect","host":"a"}` + "\n" + long + "\n" + `{"kind":"connect","host":"b"}` + "\n"
+	evs, skipped := Read(strings.NewReader(in))
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2: the events after a too-long line must still be read", len(evs))
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1 for the discarded line", skipped)
+	}
+}
+
+func TestParseLine(t *testing.T) {
+	e, ok := ParseLine([]byte("  {\"kind\":\"connect\",\"host\":\"a\"}\n"))
+	if !ok || e.Host != "a" {
+		t.Errorf("ParseLine on an event line: %+v, %v", e, ok)
+	}
+	if _, ok := ParseLine([]byte("not json")); ok {
+		t.Error("ParseLine accepted junk")
+	}
+	if _, ok := ParseLine([]byte(`{"host":"a"}`)); ok {
+		t.Error("a line with no kind is not an event")
+	}
 }

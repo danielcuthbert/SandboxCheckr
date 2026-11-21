@@ -94,7 +94,7 @@ func Execute(ctx context.Context, opts Options) model.Report {
 			b.Notes = append(b.Notes, "baseline probes did not complete: "+err.Error())
 		} else {
 			b.Probes = results
-			rank.Score(&b)
+			rank.Score(&b, nil)
 		}
 		rep.Baseline = &b
 	}
@@ -142,8 +142,9 @@ func Execute(ctx context.Context, opts Options) model.Report {
 		rep.Mechanisms = append(rep.Mechanisms, mr)
 	}
 
-	// Stage 4.
-	rep.Recommended, rep.RecommendedNetwork = rank.Apply(rep.Mechanisms)
+	// Stage 4. The baseline is the control: a probe that could not conclude, or
+	// that the bare host already blocks, is not evidence about the mechanism.
+	rep.Recommended, rep.RecommendedNetwork = rank.Apply(rep.Mechanisms, rep.Baseline)
 	rep.Gaps = gapsFor(rep)
 	rep.NextSteps = nextSteps(rep)
 

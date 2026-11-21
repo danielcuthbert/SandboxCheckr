@@ -434,3 +434,114 @@ func TestHostsAndAgentsCountDns(t *testing.T) {
 		t.Fatalf("agent denials = %d and %d, want 1 each", byAgent["a1"].Denied, byAgent["a2"].Denied)
 	}
 }
+
+func jsonLine(agent, host string) string {
+	return fmt.Sprintf(`{"t":"2026-10-12T09:00:00Z","agent":%q,"kind":"connect","decision":"allow","host":%q,"port":"443"}`+"\n", agent, host)
+}
+
+// Rotating the log restarts the tail at offset 0. The events loaded from the
+// old file have to go with it, or summary counts every pre-rotation agent,
+// connect and canary trip twice with nothing on screen to say so.
+func TestTailRotationReloadsFromEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	old := jsonLine("a1", "one.test") + jsonLine("a1", "two.test")
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Console{Path: path, Out: Printer{W: io.Discard}}
+	if err := c.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.evs) != 2 {
+		t.Fatalf("%d events loaded, want 2", len(c.evs))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Tail(ctx, Filter{}) }()
+	// Let tail take its offset at the old end of file, then rotate.
+	time.Sleep(300 * time.Millisecond)
+	if err := os.WriteFile(path, []byte(jsonLine("a2", "three.test")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	s := Summarise(c.evs)
+	if s.Events != 1 || s.Connects != 1 || len(s.Agents) != 1 || s.Agents[0].Agent != "a2" {
+		t.Errorf("after a rotation the console holds %+v; want only the 1 event of the new file", s)
+	}
+}
+
+// Two knocks on one closed door is one relay tried, not two: the PROBING
+// verdict and the finding that says "refused at N relays" both count doors.
+func TestProbingCountsDistinctRelayHosts(t *testing.T) {
+	one := []events.Event{
+		ev(0, "a1", events.KindConnect, events.Deny, "is.gd", "URL shortener", true),
+		ev(1, "a1", events.KindConnect, events.Deny, "is.gd", "URL shortener", true),
+	}
+	rows := Agents(one)
+	if rows[0].RelayDeny != 2 || rows[0].RelayDenyHosts != 1 {
+		t.Fatalf("RelayDeny=%d RelayDenyHosts=%d, want 2 events at 1 host", rows[0].RelayDeny, rows[0].RelayDenyHosts)
+	}
+	if rows[0].RetriedAfterDenial {
+		t.Error("the same door twice is not having tried others")
+	}
+	if v := Verdict(rows[0]); v != VerdictQuiet {
+		t.Errorf("verdict %q, want quiet: refusals at one relay are not probing", v)
+	}
+	for _, f := range Summarise(one).Findings {
+		if strings.Contains(f.Text, "kept trying others") {
+			t.Errorf("no probing finding for one closed door: %q", f.Text)
+		}
+	}
+	// Two doors refused is probing, and the count in the text is of doors.
+	two := append(append([]events.Event(nil), one...),
+		ev(2, "a1", events.KindConnect, events.Deny, "cutt.ly", "URL shortener", true))
+	if v := Verdict(Agents(two)[0]); v != VerdictProbing {
+		t.Errorf("verdict %q, want %s", v, VerdictProbing)
+	}
+	var text string
+	for _, f := range Summarise(two).Findings {
+		if strings.Contains(f.Text, "kept trying others") {
+			text = f.Text
+		}
+	}
+	if !strings.Contains(text, "refused at 2 relays") {
+		t.Errorf("finding should count distinct relays, got %q", text)
+	}
+	// Getting through at the door that refused you earlier is not going round
+	// the doors either.
+	round := []events.Event{
+		ev(0, "a1", events.KindConnect, events.Deny, "is.gd", "URL shortener", true),
+		ev(1, "a1", events.KindConnect, events.Allow, "is.gd", "URL shortener", true),
+	}
+	if Agents(round)[0].RetriedAfterDenial {
+		t.Error("an agent allowed where it was refused did not try another relay")
+	}
+}
+
+// The kill-switch listing shows the file's own lines. ParseDenyList strips the
+// "*." of a wildcard, and showing its output made "unblock example.com" look
+// like it removed less than it does.
+func TestBlockedShowsRawFileLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deny.txt")
+	if err := os.WriteFile(path, []byte("# kill switch\n*.example.com\nslow.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &Console{DenyPath: path, Out: Printer{W: &out}}
+	if err := c.Run(context.Background(), "blocked"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "*.example.com") {
+		t.Errorf("the wildcard must be shown as the file has it: %s", got)
+	}
+	if !strings.Contains(got, "slow.test") {
+		t.Errorf("plain entry missing: %s", got)
+	}
+	if strings.Contains(got, "# kill switch") {
+		t.Errorf("comments are not entries: %s", got)
+	}
+}

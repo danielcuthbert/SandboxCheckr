@@ -14,10 +14,13 @@ package events
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -75,9 +78,14 @@ type Event struct {
 // Writer appends events for one agent. A nil *Writer discards everything, so
 // callers need no "is logging on" checks.
 type Writer struct {
-	mu    sync.Mutex
-	w     io.Writer
-	agent string
+	mu      sync.Mutex
+	w       io.Writer
+	agent   string
+	dropped atomic.Int64
+	// Log receives one line the first time a write fails, so a full disk is
+	// noticed rather than silently emptying the audit trail. nil keeps the
+	// writer silent. Set it before the first Write, as proxy.Server.Log is.
+	Log io.Writer
 }
 
 // NewWriter returns a Writer that labels every event with agent.
@@ -97,13 +105,33 @@ func (w *Writer) Write(e Event) {
 	e.Time = e.Time.UTC()
 	e.Agent = w.agent
 	b, err := json.Marshal(e)
-	if err != nil {
-		return
+	if err == nil {
+		b = append(b, '\n')
+		w.mu.Lock()
+		_, err = w.w.Write(b)
+		w.mu.Unlock()
 	}
-	b = append(b, '\n')
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	_, _ = w.w.Write(b)
+	if err != nil {
+		w.failed(err)
+	}
+}
+
+// failed counts one lost event. This is the record the console asks questions
+// of afterwards, so a write that fails on a full disk says so once, on Log,
+// and every failure after it is counted rather than dropped on the floor.
+func (w *Writer) failed(err error) {
+	if w.dropped.Add(1) == 1 && w.Log != nil {
+		fmt.Fprintf(w.Log, "sandboxcheckr: event log write failed: %v (further failures are counted, not reported)\n", err)
+	}
+}
+
+// Dropped is how many events could not be written. A shortfall nobody can see
+// is not an audit trail, so the proxy exit summary and the console show it.
+func (w *Writer) Dropped() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.dropped.Load()
 }
 
 // AgentLabel reduces a label to letters, digits and . _ - so it can be shown
@@ -124,26 +152,74 @@ func AgentLabel(s string) string {
 	return b.String()
 }
 
+// MaxLine is the largest event line Read accepts; a longer one is junk, since
+// one event is one JSON object. Console callers tailing a log use the same cap
+// so the two never disagree about what is lost.
+const MaxLine = 1 << 20
+
 // Read parses an event log, skipping lines that are not events. It returns
-// the events in file order and the number of lines skipped.
+// the events in file order and the number of lines skipped. The count is the
+// console's only integrity signal, so nothing may be lost without adding to it.
 func Read(r io.Reader) ([]Event, int) {
 	var out []Event
 	skipped := 0
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1<<20)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(strings.TrimSpace(string(line))) == 0 {
-			continue
-		}
-		var e Event
-		if err := json.Unmarshal(line, &e); err != nil || e.Kind == "" {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, tooLong, err := readLine(br)
+		if tooLong {
+			// Past the cap the line is junk; count it and move on.
 			skipped++
+		} else if len(bytes.TrimSpace(line)) > 0 {
+			if e, ok := ParseLine(line); ok {
+				out = append(out, e)
+			} else {
+				skipped++
+			}
+		}
+		if err != nil {
+			// A read error that is not the end of the file lost whatever was
+			// left; say so in the only channel the console has. A line already
+			// counted as too long is one loss, not two.
+			if err != io.EOF && !tooLong {
+				skipped++
+			}
+			return out, skipped
+		}
+	}
+}
+
+// readLine returns the next line of br without its newline, whether it ran
+// past MaxLine, and the reader's error. Reading with ReadSlice rather than a
+// Scanner is what lets one oversized line be dropped instead of ending the
+// scan: a bufio.Scanner stops at ErrTooLong and every event after it is lost
+// without a trace.
+func readLine(br *bufio.Reader) (line []byte, tooLong bool, err error) {
+	for {
+		chunk, e := br.ReadSlice('\n')
+		line = append(line, chunk...)
+		if len(line) > MaxLine {
+			tooLong = true
+		}
+		if e == bufio.ErrBufferFull {
 			continue
 		}
-		out = append(out, e)
+		if e != nil {
+			return line, tooLong, e
+		}
+		return line[:len(line)-1], tooLong, nil
 	}
-	return out, skipped
+}
+
+// ParseLine parses one event line and reports whether it held an event.
+// Callers tailing a log use it instead of Read: Read copies the reader's
+// buffer per call, which makes following a busy log quadratic and allocates
+// twice for every event.
+func ParseLine(line []byte) (Event, bool) {
+	var e Event
+	if err := json.Unmarshal(bytes.TrimSpace(line), &e); err != nil || e.Kind == "" {
+		return Event{}, false
+	}
+	return e, true
 }
 
 // Clean makes an untrusted string safe to print: control and format

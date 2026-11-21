@@ -189,13 +189,25 @@ var SkipWhenScanning = []string{"node_modules", ".venv", "vendor", "target"}
 // in any nested repository. It is what a mechanism that can only protect
 // existing paths (bubblewrap, which binds over them) needs; Seatbelt matches
 // by pattern and does not use it.
-func ProtectedInWorkdir(workdir string) (secrets, execConfig []string) {
+//
+// The third result is the first entry the walk could not read, and the lists
+// come back with whatever was found before that. Empty lists with no error
+// mean there was nothing to protect; empty lists with an error mean the scan
+// could not tell, which a caller must not present as a protected workdir.
+func ProtectedInWorkdir(workdir string) (secrets, execConfig []string, err error) {
 	skip := map[string]bool{}
 	for _, d := range SkipWhenScanning {
 		skip[d] = true
 	}
+	var walkErr error
 	_ = filepath.WalkDir(workdir, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			// Keep the entries already found, but remember that the picture
+			// is incomplete: a workdir this process cannot read is not a
+			// workdir with nothing in it to protect.
+			if walkErr == nil {
+				walkErr = err
+			}
 			return nil
 		}
 		if d.IsDir() {
@@ -225,7 +237,7 @@ func ProtectedInWorkdir(workdir string) (secrets, execConfig []string) {
 		}
 		return nil
 	})
-	return secrets, execConfig
+	return secrets, execConfig, walkErr
 }
 
 // isExecConfig matches ExecConfigPaths other than those under .git, which the

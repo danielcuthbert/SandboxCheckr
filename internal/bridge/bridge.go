@@ -77,21 +77,38 @@ func ServeAll(ctx context.Context, listen string, binds []string, to string, onB
 		// A listener without an address is the proxy port itself: its clients
 		// speak the HTTP proxy protocol. Every other one fronts a permitted
 		// port, so the bridge speaks that protocol on the client's behalf.
-		forward := func(c net.Conn) { relay(c, to) }
+		forward := func(c net.Conn) { relay(ctx, c, to) }
 		if l.addr != "" {
 			dest := l.addr
-			forward = func(c net.Conn) { relayTunneled(c, to, dest) }
+			forward = func(c net.Conn) { relayTunneled(ctx, c, to, dest) }
 		}
 		go acceptLoop(ctx, l.ln, forward)
 	}
 	return nil
 }
 
+// maxConns bounds how many connections one listener is relaying at once, the
+// same shape as the DNS relay's semaphore: each relay dials the proxy, so an
+// unbounded fan-out lets a single client exhaust the bridge instead of itself.
+const maxConns = 64
+
+// maxAcceptFailures is how many consecutive accept errors the loop tolerates
+// before giving up. Isolated ones are just EMFILE under load and back off, but
+// a listener that cannot accept a hundred times running is broken, and a retry
+// loop that never returns burns a core inside a sandbox that should be
+// quiescent.
+const maxAcceptFailures = 100
+
 func acceptLoop(ctx context.Context, ln net.Listener, forward func(net.Conn)) {
+	sem := make(chan struct{}, maxConns)
+	failures := 0
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if failures++; failures >= maxAcceptFailures {
 				return
 			}
 			// A transient accept error (EMFILE under load) must not kill the
@@ -99,45 +116,102 @@ func acceptLoop(ctx context.Context, ln net.Listener, forward func(net.Conn)) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		go forward(c)
+		failures = 0
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			_ = c.Close()
+			return
+		}
+		go func() {
+			defer func() { <-sem }()
+			forward(c)
+		}()
 	}
 }
 
 // relay pipes a connection from the main listener straight to the proxy: the
 // client speaks the HTTP proxy protocol itself, so the proxy reads the
 // destination from its request.
-func relay(c net.Conn, to string) {
+func relay(ctx context.Context, c net.Conn, to string) {
 	defer c.Close()
 	u, err := net.DialTimeout("unix", to, 5*time.Second)
 	if err != nil {
 		return
 	}
 	defer u.Close()
-	pipeBoth(c, u)
+	pipeBoth(ctx, c, u)
 }
 
 // ServeDNS relays DNS queries from the sandbox's loopback to the proxy's DNS
-// socket. It binds listen — 127.0.0.1:53053, the address the sandbox's
-// resolv.conf points at — and answers each datagram by exchanging a framed
-// query with the proxy, which gates the name and resolves host-side. A query
-// that cannot be relayed is dropped: the client retries, and an unreachable
-// resolver is exactly what the sandbox looks like when the proxy is gone.
-// The bind can fail when the policy permits port 53 for tunnelling; the
-// failure is reported and resolution is simply unavailable.
+// socket. It binds listen (127.0.0.1:53, the address the sandbox's resolv.conf
+// points at) on both UDP and TCP and answers each query by exchanging a framed
+// message with the proxy, which gates the name and resolves host-side. TCP is
+// not optional: glibc and musl retry over TCP whenever an answer comes back
+// with TC=1, routine for DNSSEC-signed answers and large A or AAAA sets, so a
+// UDP-only relay makes those lookups hard-fail. A query that cannot be relayed
+// is dropped: the client retries, and an unreachable resolver is exactly what
+// the sandbox looks like when the proxy is gone. The bind can fail when the
+// policy permits port 53 for tunnelling; each transport that fails is reported
+// and resolution over it is simply unavailable.
 func ServeDNS(ctx context.Context, listen, sock string, onBindError func(err error)) {
-	pc, err := BindDNS(listen)
-	if err != nil {
-		if onBindError != nil {
-			onBindError(err)
-		}
+	pc, udpErr := BindDNS(listen)
+	if udpErr != nil && onBindError != nil {
+		onBindError(udpErr)
+	}
+	ln, tcpErr := BindDNSTCP(listen)
+	if tcpErr != nil && onBindError != nil {
+		onBindError(tcpErr)
+	}
+	if udpErr != nil && tcpErr != nil {
 		return
 	}
-	ServeDNSConn(ctx, pc, sock)
+	if ln != nil {
+		// One handler, one semaphore, one retry policy for both transports:
+		// the only difference is the length prefix a datagram boundary already
+		// carries for UDP.
+		go acceptLoop(ctx, ln, func(c net.Conn) { serveDNSQuery(c, sock) })
+	}
+	if pc != nil {
+		ServeDNSConn(ctx, pc, sock)
+	}
 }
 
 // BindDNS binds the UDP relay socket.
 func BindDNS(listen string) (net.PacketConn, error) {
 	return net.ListenPacket("udp", listen)
+}
+
+// BindDNSTCP binds the TCP relay socket, which carries the same queries with
+// the two-byte length prefix RFC 1035 puts on a message sent over a stream.
+func BindDNSTCP(listen string) (net.Listener, error) {
+	return net.Listen("tcp", listen)
+}
+
+// serveDNSQuery answers one TCP query: a length-prefixed message in, a
+// length-prefixed answer out, then the connection is done. Resolvers retry
+// over a fresh connection, so one query per connection is all a client needs.
+func serveDNSQuery(c net.Conn, sock string) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	var lb [2]byte
+	if _, err := io.ReadFull(c, lb[:]); err != nil {
+		return
+	}
+	query := make([]byte, binary.BigEndian.Uint16(lb[:]))
+	if _, err := io.ReadFull(c, query); err != nil {
+		return
+	}
+	resp, err := exchange(sock, query)
+	if err != nil || len(resp) > maxDNSFrame {
+		// A reply too long to carry its own prefix is no reply at all; drop it
+		// and let the resolver's own timeout answer.
+		return
+	}
+	out := make([]byte, 2+len(resp))
+	binary.BigEndian.PutUint16(out, uint16(len(resp)))
+	copy(out[2:], resp)
+	_, _ = c.Write(out)
 }
 
 // ServeDNSConn relays DNS queries on an already bound socket until the
@@ -172,6 +246,13 @@ func ServeDNSConn(ctx context.Context, pc net.PacketConn, sock string) {
 	}
 }
 
+// maxDNSFrame is the largest message the framed protocol carries: the 65535
+// byte cap RFC 1035 puts on a DNS message, and the bound the proxy's own
+// reader applies (internal/proxy handleDNS). The two ends of one framing
+// protocol have to agree on it, or a peer on either side can ask the other for
+// a 4 GiB allocation from a length field it chose itself.
+const maxDNSFrame = 65535
+
 // exchange performs one framed query against the proxy's DNS socket: a 4-byte
 // big-endian length plus the raw DNS message, response the same way.
 func exchange(sock string, query []byte) ([]byte, error) {
@@ -192,7 +273,11 @@ func exchange(sock string, query []byte) ([]byte, error) {
 	if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
 		return nil, err
 	}
-	resp := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n == 0 || n > maxDNSFrame {
+		return nil, fmt.Errorf("dns frame length %d out of range", n)
+	}
+	resp := make([]byte, n)
 	if _, err := io.ReadFull(c, resp); err != nil {
 		return nil, err
 	}
@@ -202,7 +287,7 @@ func exchange(sock string, query []byte) ([]byte, error) {
 // relayTunneled serves a connection to a bound permitted port: the client
 // speaks to its destination directly, so the bridge asks the proxy for the
 // tunnel itself and pipes raw bytes after the proxy agrees.
-func relayTunneled(c net.Conn, to, dest string) {
+func relayTunneled(ctx context.Context, c net.Conn, to, dest string) {
 	defer c.Close()
 	u, err := net.DialTimeout("unix", to, 5*time.Second)
 	if err != nil {
@@ -226,12 +311,68 @@ func relayTunneled(c net.Conn, to, dest string) {
 			return
 		}
 	}
-	pipeBoth(c, u)
+	pipeBoth(ctx, c, u)
 }
 
-func pipeBoth(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(b, a); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(a, b); done <- struct{}{} }()
-	<-done
+// tunnelIdle is how long a bridged connection may carry nothing in either
+// direction before the bridge drops it. Cancelling the context closes the
+// listeners, not the established tunnels, and a peer that stops talking
+// without ever sending a FIN would otherwise hold two goroutines and two
+// sockets for the rest of the run. The value is generous enough for a keep
+// alive or a dev server fronted by a permitted port.
+const tunnelIdle = 30 * time.Minute
+
+// pipeDrainWait bounds the wait for the second direction after the first has
+// reached end of stream, so a peer that never finishes its response cannot
+// hold the connection open forever.
+const pipeDrainWait = 5 * time.Second
+
+// pipe copies src to dst until either end reports an error. It sets the
+// deadlines itself, before every read, so what is bounded is the gap between
+// bytes rather than the life of the connection.
+func pipe(dst, src net.Conn, done chan<- net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(tunnelIdle))
+		n, err := src.Read(buf)
+		if n > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(tunnelIdle))
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				err = werr
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	done <- dst
+}
+
+// halfCloseWrite signals end of stream to one end of a tunnel. A stream socket
+// has a write half to close; on a unix socket there is nothing to do.
+func halfCloseWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+func pipeBoth(ctx context.Context, a, b net.Conn) {
+	done := make(chan net.Conn, 2)
+	go pipe(b, a, done)
+	go pipe(a, b, done)
+	// The copy that finished first reached its source's end of stream, usually
+	// the client half-closing its write side after sending the request.
+	// Closing both halves here truncates the response still in flight on the
+	// other one, so signal end of stream the same way instead and let that
+	// copy run out.
+	fin := <-done
+	halfCloseWrite(fin)
+	select {
+	case <-done:
+	case <-time.After(pipeDrainWait):
+	case <-ctx.Done():
+	}
+	_ = a.Close()
+	_ = b.Close()
 }

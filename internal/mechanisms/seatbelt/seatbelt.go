@@ -669,7 +669,11 @@ func runnerScript(m *Mechanism, profileName string, w mechanism.Workdir) string 
 		// Not "${SANDBOXCHECKR:-'...'}": inside double quotes the single quotes
 		// would be kept literally and the path would never resolve.
 		fmt.Fprintf(&b, "SANDBOXCHECKR_DEFAULT=%s\n", selfPathForScript())
-		b.WriteString("SANDBOXCHECKR=\"${SANDBOXCHECKR:-$SANDBOXCHECKR_DEFAULT}\"\n")
+		// Pinned, not taken from the environment: this binary runs OUTSIDE the
+		// sandbox as the egress proxy and the canary generator, so an
+		// inherited SANDBOXCHECKR would run attacker-chosen code unsandboxed.
+		// The bubblewrap runner applies the same rule.
+		b.WriteString("SANDBOXCHECKR=\"$SANDBOXCHECKR_DEFAULT\"\n")
 	}
 	b.WriteString(runnerBody)
 	if m.proxyPort != 0 {
@@ -777,7 +781,10 @@ done
 // profile, after any EXTRA_RO / EXTRA_RW grants. Seatbelt takes the LAST
 // matching rule, so a grant appended after the deny — EXTRA_RW naming the
 // project itself, say — would quietly undo it. Each block is dropped only when
-// the user explicitly opts out of it.
+// the user explicitly opts out of it. A block that is not in the profile at all
+// is not an opt-out: the blocks are cut out of the main text by sed below, so a
+// hand-edited or damaged profile would otherwise run with .env readable and
+// the hooks writable and nothing said about it.
 const runnerProtect = `
 # Workdir protections (SBX-011): no .env reads, no writes to files other
 # programs execute later. Re-applied after EXTRA_* so a grant cannot undo them.
@@ -786,14 +793,20 @@ PROTECT=""
 if [ "${ALLOW_DOTENV:-0}" = 1 ]; then
   echo "sandboxcheckr: ALLOW_DOTENV=1 — .env files in the workdir are readable by the program" >&2
 else
+  # Checked outside a command substitution on purpose: an exit inside $(...)
+  # would only leave the block empty and the run would continue unprotected.
+  BLOCK=$(protect_block protect-dotenv)
+  [ -n "$BLOCK" ] || { echo "sandboxcheckr: $PROFILE has no ;; BEGIN protect-dotenv block, so .env files in the workdir are readable" >&2; echo "  Re-emit it (sandboxcheckr --emit), or set ALLOW_DOTENV=1 if you mean it." >&2; exit 2; }
   PROTECT="$PROTECT
-$(protect_block protect-dotenv)"
+$BLOCK"
 fi
 if [ "${ALLOW_EXEC_CONFIG:-0}" = 1 ]; then
   echo "sandboxcheckr: ALLOW_EXEC_CONFIG=1 — git hooks, CI workflows and editor tasks are writable; review them before you commit or open the editor" >&2
 else
+  BLOCK=$(protect_block protect-exec-config)
+  [ -n "$BLOCK" ] || { echo "sandboxcheckr: $PROFILE has no ;; BEGIN protect-exec-config block, so git hooks, CI workflows and editor tasks are writable" >&2; echo "  Re-emit it (sandboxcheckr --emit), or set ALLOW_EXEC_CONFIG=1 if you mean it." >&2; exit 2; }
   PROTECT="$PROTECT
-$(protect_block protect-exec-config)"
+$BLOCK"
 fi
 PROFILE_TEXT=$(printf '%s\n' "$PROFILE_TEXT" | sed '/^;; BEGIN protect-/,/^;; END protect-/d')
 `
@@ -989,6 +1002,18 @@ func (m *Mechanism) KnownGaps() []model.Gap {
 				"files and the source itself cannot be without breaking the agent. Anything the program " +
 				"changes there runs unconfined the next time you build or test outside the sandbox. Review " +
 				"the diff before you run it.",
+		},
+		{
+			Severity: "medium",
+			Title:    "The terminal is inherited, and escape sequences act with the user's privileges",
+			Detail: "The confined process keeps the pty it was started on, so bytes it writes reach " +
+				"the terminal emulator, which acts on them as the user. OSC 52 sets the clipboard, which " +
+				"moves data out of the sandbox into whatever the user pastes next; iTerm2's OSC 1337 can " +
+				"be asked to open a URL or transfer a file, and OSC 7 rewrites the terminal's idea of the " +
+				"working directory. Nothing in the profile covers any of it: the rules gate files and " +
+				"sockets, not what the terminal does with a byte stream. The clipboard probe checks the " +
+				"pasteboard command (pbpaste), not this path. Pipe the program's output rather than " +
+				"attaching a tty, or use a terminal configured to ignore OSC 52 and 1337, when it matters.",
 		},
 		{
 			Severity: "medium",

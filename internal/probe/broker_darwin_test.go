@@ -3,6 +3,7 @@
 package probe
 
 import (
+	"context"
 	"testing"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
@@ -11,7 +12,7 @@ import (
 // The brokered-egress probes must declare BLOCKED as healthy (a daemon fetching
 // on the process's behalf is a leak) and always carry an explanation.
 func TestBrokerProbesDeclareWantBlocked(t *testing.T) {
-	got := brokerProbes()
+	got := brokerProbes(context.Background())
 	if len(got) != 3 {
 		t.Fatalf("expected 3 broker probes, got %d", len(got))
 	}

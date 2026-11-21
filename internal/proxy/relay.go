@@ -143,29 +143,32 @@ func normHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimPrefix(host, ".")), ".")
 }
 
-// RelayKind reports whether host looks like a store-or-forward service, and
-// which kind. Empty means no match.
-func RelayKind(host string) string {
+// classify answers both relay questions about a host in one walk of the
+// pattern list. RelayKind and RelaysOnGet answered them independently, so every
+// caller paid for two walks that had to agree by construction anyway.
+func classify(host string) (kind string, onGet bool) {
 	h := normHost(host)
 	for _, p := range relayPatterns {
 		if hostMatches(h, p.match) {
-			return p.kind
+			return p.kind, p.onGet
 		}
 	}
-	return ""
+	return "", false
+}
+
+// RelayKind reports whether host looks like a store-or-forward service, and
+// which kind. Empty means no match.
+func RelayKind(host string) string {
+	kind, _ := classify(host)
+	return kind
 }
 
 // RelaysOnGet reports whether a plain GET to host can store data or reach
 // another host, so that a download-only rule does not make it safe. Allowing
 // such a host is close to allowing the whole internet.
 func RelaysOnGet(host string) bool {
-	h := normHost(host)
-	for _, p := range relayPatterns {
-		if hostMatches(h, p.match) {
-			return p.onGet
-		}
-	}
-	return false
+	_, onGet := classify(host)
+	return onGet
 }
 
 // codeHostPatterns are hosts that serve arbitrary user-controlled content

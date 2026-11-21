@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,82 @@ func TestAddressGuardHonoursOverride(t *testing.T) {
 	a.AllowPrivate = true
 	if err := a.CheckAddr(net.ParseIP("169.254.169.254")); err != nil {
 		t.Error("--allow-private should permit link-local")
+	}
+}
+
+// Ranges the guard used to leave open. Each is unreachable in a default
+// install, which is what makes them worth closing: the ones that matter are
+// reachable exactly when something else on the host has already put a route
+// there, and that is the case where an allow-listed name answering from one of
+// them is indistinguishable from a redirect to a host service.
+func TestAddressGuardCoversReservedRanges(t *testing.T) {
+	a, _ := NewAllowList([]string{"example.com"})
+	blocked := []string{
+		"0.1.2.3",           // "this host on this network"
+		"0.255.255.255",     //
+		"192.0.0.1",         // IETF protocol assignments
+		"198.18.0.1",        // benchmarking
+		"198.19.255.1",      //
+		"240.0.0.1",         // reserved
+		"255.255.255.255",   // limited broadcast
+		"2002:0a00:0001::",  // 6to4, embeds 10.0.0.1
+		"2001:0000:0001::1", // Teredo
+		"100::1",            // discard-only
+	}
+	for _, s := range blocked {
+		if err := a.CheckAddr(net.ParseIP(s)); err == nil {
+			t.Errorf("%s should be refused", s)
+		}
+	}
+	// Ordinary global addresses must still get through, including ones that
+	// share a prefix with a refused range at a distance.
+	for _, s := range []string{"1.1.1.1", "192.0.2.1", "198.51.100.1", "203.0.113.9", "2001:db8::1", "1000::1"} {
+		if err := a.CheckAddr(net.ParseIP(s)); err != nil {
+			t.Errorf("%s should be permitted: %v", s, err)
+		}
+	}
+}
+
+// A path rule is the only thing between "trust this code host" and "fetch
+// anybody's payload", so a prefix has to end at a path boundary. Prefix
+// matching alone admitted /acmeevil beside /acme.
+func TestHostRulePathAnchorsAtBoundary(t *testing.T) {
+	request := func(t *testing.T, target string) *http.Request {
+		t.Helper()
+		u, err := url.Parse(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Request{Method: "GET", URL: u}
+	}
+	hr, err := ParseHostRule("raw.githubusercontent.com:GET:/acme/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/acme", "/acme/", "/acme/README.md", "/acme/a/b/c"} {
+		if ok, why := hr.Permits(request(t, "http://raw.githubusercontent.com"+p)); !ok {
+			t.Errorf("%s should be permitted: %s", p, why)
+		}
+	}
+	for _, p := range []string{"/acmeevil/README.md", "/acme-secret/x", "/acme/../other/x", "/ACME/x", "/", "/x/acme/y"} {
+		if ok, _ := hr.Permits(request(t, "http://raw.githubusercontent.com"+p)); ok {
+			t.Errorf("%s should be refused by a /acme/ prefix", p)
+		}
+	}
+	// Encoded separators and dots are the server's to decode, not ours: refuse
+	// rather than guess whether %2e%2e walked out of the prefix.
+	for _, p := range []string{"/acme/%2e%2e/other/x", "/acme/%2f..%2f", "/acme/%2E%2E/x"} {
+		if ok, _ := hr.Permits(request(t, "http://raw.githubusercontent.com"+p)); ok {
+			t.Errorf("%s should be refused as encoded traversal", p)
+		}
+	}
+	// "/" is what a user writes for "any path"; it must not narrow anything.
+	root, err := ParseHostRule("raw.githubusercontent.com:GET:/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := root.Permits(request(t, "http://raw.githubusercontent.com/anything/at/all")); !ok {
+		t.Errorf("a / prefix should permit any path: %s", why)
 	}
 }
 

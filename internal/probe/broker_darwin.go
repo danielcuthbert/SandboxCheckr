@@ -22,11 +22,13 @@ import (
 // refuted); the probes remain as a regression test against a future OS change.
 
 // brokerProbes runs the macOS brokered-egress and cross-app automation checks.
-func brokerProbes() []model.ProbeResult {
+// ctx carries the battery's network budget, which bounds the helper binaries
+// these probes run as well as any socket.
+func brokerProbes(ctx context.Context) []model.ProbeResult {
 	return []model.ProbeResult{
-		probeBrokerDNS(),
-		probeBrokerLaunchServices(),
-		probeAppleEvents(),
+		probeBrokerDNS(ctx),
+		probeBrokerLaunchServices(ctx),
+		probeAppleEvents(ctx),
 	}
 }
 
@@ -39,10 +41,10 @@ func brokerProbes() []model.ProbeResult {
 // this should fail. A failure may also be TCC Automation refusing, not only the
 // sandbox; the channel is closed either way, and the confound is noted rather
 // than hidden.
-func probeAppleEvents() model.ProbeResult {
+func probeAppleEvents(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilAppleEvents, Want: model.VerdictBlocked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx, "/usr/bin/osascript", "-e",
@@ -100,10 +102,10 @@ func isExecRefused(err error) bool {
 // mDNSResponder over Mach rather than opening a DNS socket itself. Resolution
 // succeeding is the finding: it means brokered DNS is reachable despite any
 // socket-level deny.
-func probeBrokerDNS() model.ProbeResult {
+func probeBrokerDNS(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilBrokerDNS, Want: model.VerdictBlocked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx, "/usr/bin/dscacheutil",
@@ -150,10 +152,10 @@ var resolverWorksUnconfined = func() bool { return HostOnline }
 // from reading the LaunchServices database, which a sandboxed process may do;
 // it never reaches the launch path, so the probe reported a hole in profiles
 // that actually block launching.
-func probeBrokerLaunchServices() model.ProbeResult {
+func probeBrokerLaunchServices(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilBrokerLaunch, Want: model.VerdictBlocked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx, "/usr/bin/open", "-g", "-j", "-a",

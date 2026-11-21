@@ -10,8 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
-	"time"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
 )
@@ -116,15 +116,16 @@ const tunnelLabel = "sandboxcheckr-probe-0000000000000000000000000000"
 // the same process — i.e. when the resolver is demonstrably reachable.
 const tunnelDomain = ".invalid"
 
-// RunExfilBattery enumerates exfiltration channels.
-func RunExfilBattery(h home) []model.ProbeResult {
+// RunExfilBattery enumerates exfiltration channels. ctx carries the battery's
+// shared network budget; see networkBudget.
+func RunExfilBattery(ctx context.Context, h home) []model.ProbeResult {
 	return []model.ProbeResult{
 		probeEnvSecrets(),
 		probeSharedScratch(),
 		probeSyncDirs(h),
-		probeProxyEnv(),
-		probeClipboard(),
-		probeDNSTunnel(),
+		probeProxyEnv(ctx),
+		probeClipboard(ctx),
+		probeDNSTunnel(ctx),
 	}
 }
 
@@ -196,22 +197,32 @@ func hasAnySuffix(s string, suffixes []string) bool {
 	return false
 }
 
+// privateScratchDirs are the sharedScratchDirs the mechanism replaces with a
+// per-sandbox tmpfs and advertises by setting SANDBOXCHECKR_PRIVATE_TMP. bwrap
+// sets that marker for /tmp alone (see internal/mechanisms/bwrap), so it says
+// nothing about the rest of the list: honouring it for all of them let a host
+// with a private /tmp and a genuinely shared /dev/shm report no peer channel at
+// all.
+var privateScratchDirs = []string{"/tmp", "/private/tmp"}
+
 // probeSharedScratch reports writable directories other sandboxed processes can
 // also see. This is the message-board channel.
 func probeSharedScratch() model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilSharedScratch, Want: model.VerdictBlocked}
 
-	// The mechanism told us /tmp is a private per-sandbox tmpfs: writable, but
-	// two sandboxes cannot see each other's files there, so there is no peer
-	// channel. Report that instead of a false alarm from writability alone.
-	if os.Getenv("SANDBOXCHECKR_PRIVATE_TMP") == "1" {
-		r.Verdict = model.VerdictBlocked
-		r.Detail = "/tmp is a private per-sandbox tmpfs: writable, but not shared between sandboxes"
-		return r
-	}
+	// The mechanism told us the scratch directory is a private per-sandbox
+	// tmpfs: writable, but two sandboxes cannot see each other's files there, so
+	// those paths are not a peer channel. The remaining candidates are still
+	// tested, because their privacy was never declared, and a shared /dev/shm
+	// behind a private /tmp is exactly the channel this probe exists to find.
+	private := os.Getenv("SANDBOXCHECKR_PRIVATE_TMP") == "1"
 
-	var writable []string
+	var writable, privateHits []string
 	for _, dir := range sharedScratchDirs {
+		if private && slices.Contains(privateScratchDirs, dir) {
+			privateHits = append(privateHits, dir)
+			continue
+		}
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 			continue
 		}
@@ -227,7 +238,12 @@ func probeSharedScratch() model.ProbeResult {
 
 	if len(writable) == 0 {
 		r.Verdict = model.VerdictBlocked
-		r.Detail = "no world-shared scratch directory is writable"
+		if len(privateHits) > 0 {
+			r.Detail = "no world-shared scratch directory is writable; " +
+				strings.Join(privateHits, " and ") + " is a private per-sandbox tmpfs"
+		} else {
+			r.Detail = "no world-shared scratch directory is writable"
+		}
 		return r
 	}
 	r.Verdict = model.VerdictAllowed
@@ -286,11 +302,16 @@ func probeSyncDirs(h home) model.ProbeResult {
 
 // probeProxyEnv reports an inherited HTTP proxy, which is a working egress path
 // even where direct sockets are refused.
-func probeProxyEnv() model.ProbeResult {
+func probeProxyEnv(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilProxyEnv, Want: model.VerdictBlocked}
 
 	var set []string
 	var relaying, enforcing, unclear []string
+	// Whether a proxy is configured costs nothing to answer, so the shared
+	// network budget is only consulted at the dials themselves. Refusing a probe
+	// that had no socket to open would report an environment with no proxy at all
+	// as inconclusive.
+	budgetGone := false
 	// Several variables usually point at the same proxy; report each endpoint
 	// once rather than repeating it per variable name.
 	seenProxy := map[string]bool{}
@@ -305,7 +326,11 @@ func probeProxyEnv() model.ProbeResult {
 			continue
 		}
 		seenProxy[hp] = true
-		switch proxyRelays(hp) {
+		if ctx.Err() != nil {
+			budgetGone = true
+			break
+		}
+		switch proxyRelays(ctx, hp) {
 		case relayYes:
 			relaying = append(relaying, hp)
 		case relayRefused:
@@ -320,6 +345,11 @@ func probeProxyEnv() model.ProbeResult {
 	// control working, not a leak — counting it as one would score the
 	// proxied sandbox below the unproxied one for having egress control.
 	switch {
+	case budgetGone:
+		r.Verdict = model.VerdictErrored
+		r.Err = ctx.Err().Error()
+		r.Detail = "the battery network budget was exhausted before the inherited proxy could be " +
+			"tested; not counted as contained"
 	case len(set) == 0:
 		r.Verdict = model.VerdictBlocked
 		r.Detail = "no HTTP proxy is configured in the environment"
@@ -354,13 +384,14 @@ const (
 // proxyRelays asks the proxy to tunnel to egressAddr, a literal IP no sane
 // allow-list contains, and reads only the status line. Nothing is sent through
 // the tunnel if it opens.
-func proxyRelays(hp string) relayResult {
-	conn, err := net.DialTimeout("tcp", hp, dialTimeout)
+func proxyRelays(ctx context.Context, hp string) relayResult {
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", hp)
 	if err != nil {
 		return relayUnreachable
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * dialTimeout))
+	_ = conn.SetDeadline(deadline(ctx, 2*dialTimeout))
 	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", egressAddr, egressAddr); err != nil {
 		return relayUnknown
 	}
@@ -414,7 +445,7 @@ func proxyHostPort(raw string) string {
 // Writing would clobber whatever the user has copied, and inspecting would mean
 // this tool handling the user's clipboard contents — neither is acceptable for
 // a check that only needs to know whether the channel exists.
-func probeClipboard() model.ProbeResult {
+func probeClipboard(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilClipboard, Want: model.VerdictBlocked}
 
 	var tool string
@@ -435,7 +466,7 @@ func probeClipboard() model.ProbeResult {
 		return r
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tool)
 	cmd.Stdout = nil // discarded: we never look at clipboard contents
@@ -477,10 +508,13 @@ func probeClipboard() model.ProbeResult {
 // whereas tunnelling requires the query NAME itself to carry outward data. A
 // resolver answering NXDOMAIN for a label nobody has ever registered proves the
 // label left the machine, which is the whole primitive.
-func probeDNSTunnel() model.ProbeResult {
+func probeDNSTunnel(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilDNSTunnel, Want: model.VerdictBlocked}
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
 	res := &net.Resolver{}
@@ -498,7 +532,7 @@ func probeDNSTunnel() model.ProbeResult {
 	// resolve, the NXDOMAIN was synthesised locally and no query escaped.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-		ctx2, cancel2 := context.WithTimeout(context.Background(), dialTimeout)
+		ctx2, cancel2 := context.WithTimeout(ctx, dialTimeout)
 		defer cancel2()
 		if addrs, cerr := res.LookupHost(ctx2, egressHost); cerr == nil && len(addrs) > 0 {
 			r.Verdict = model.VerdictAllowed

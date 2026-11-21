@@ -116,11 +116,15 @@ func Select(evs []events.Event, f Filter) []events.Event {
 
 // AgentSummary is one agent's activity.
 type AgentSummary struct {
-	Agent              string
-	First, Last        time.Time
-	Connects, Denied   int
-	Hosts              int
-	Relays, RelayDeny  int
+	Agent             string
+	First, Last       time.Time
+	Connects, Denied  int
+	Hosts             int
+	Relays, RelayDeny int
+	// RelayDenyHosts is the number of distinct relay hosts the agent was
+	// refused at. RelayDeny counts events, so two attempts at one closed door
+	// would otherwise read as probing several relays.
+	RelayDenyHosts     int
 	GetRelays          int
 	GetRelaysReached   int // GET relays the agent actually got through to
 	Uploads            int // hosts that passed the heavy-upload threshold
@@ -135,7 +139,9 @@ func Agents(evs []events.Event) []AgentSummary {
 	by := map[string]*AgentSummary{}
 	hosts := map[string]map[string]bool{}
 	relays := map[string]map[string]bool{}
-	deniedRelay := map[string]bool{}
+	// deniedRelay is per agent and host: whether that agent was refused at that
+	// relay. A per-agent boolean cannot tell two doors from one door twice.
+	deniedRelay := map[string]map[string]bool{}
 	reached := map[string]map[string]bool{}
 	for _, e := range evs {
 		a := by[e.Agent]
@@ -144,6 +150,7 @@ func Agents(evs []events.Event) []AgentSummary {
 			by[e.Agent] = a
 			hosts[e.Agent] = map[string]bool{}
 			relays[e.Agent] = map[string]bool{}
+			deniedRelay[e.Agent] = map[string]bool{}
 		}
 		if e.Time.Before(a.First) {
 			a.First = e.Time
@@ -175,9 +182,14 @@ func Agents(evs []events.Event) []AgentSummary {
 				}
 				if e.Decision == events.Deny {
 					a.RelayDeny++
-					deniedRelay[e.Agent] = true
-				} else if deniedRelay[e.Agent] {
-					// Refused at one relay, then reached another: probing.
+					if !deniedRelay[e.Agent][e.Host] {
+						deniedRelay[e.Agent][e.Host] = true
+						a.RelayDenyHosts++
+					}
+				} else if a.RelayDenyHosts > 0 && !deniedRelay[e.Agent][e.Host] {
+					// Refused at one relay, then reached a different one: going
+					// round the doors is probing. Hammering one closed door,
+					// or getting through at the door that refused you, is not.
 					a.RetriedAfterDenial = true
 				}
 			}

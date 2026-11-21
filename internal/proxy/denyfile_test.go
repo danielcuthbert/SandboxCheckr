@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -159,5 +160,41 @@ func TestDenyFileCutsOpenTunnel(t *testing.T) {
 		t.Fatal("expected the open tunnel to be closed")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("open tunnel was not cut within the reload interval")
+	}
+}
+
+// The file is append-mostly, so the entries lost to the size cap are the ones
+// added last, which is the opposite of what a kill switch should do quietly.
+func TestDenyFileReportsTruncation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deny.txt")
+	var b strings.Builder
+	for i := range maxDenyFileBytes/16 + 8 {
+		fmt.Fprintf(&b, "h%d.denied.test\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDenyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Truncated() {
+		t.Fatal("a list past the cap should report itself truncated")
+	}
+	entries, invalid := d.Entries()
+	if len(entries) == 0 || invalid != 0 {
+		t.Fatalf("loaded %d entries with %d invalid", len(entries), invalid)
+	}
+	if err := os.WriteFile(path, []byte("a.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := d.Refresh(); err != nil || !changed {
+		t.Fatalf("refresh of the shortened list: %v %v", changed, err)
+	}
+	if d.Truncated() {
+		t.Error("a list within the cap must not report itself truncated")
+	}
+	if _, ok := d.Match("a.test"); !ok {
+		t.Error("the shortened list is not in force")
 	}
 }

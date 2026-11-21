@@ -2,6 +2,7 @@ package console
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -54,6 +55,9 @@ type Console struct {
 	Now      func() time.Time
 	evs      []events.Event
 	skipped  int
+	// evsDropped counts events pushed out of the slice by tail's bound; the
+	// banner prints it so a truncated view is never mistaken for the whole one.
+	evsDropped int
 }
 
 // Load reads the log at c.Path.
@@ -64,12 +68,15 @@ func (c *Console) Load() error {
 	}
 	defer f.Close()
 	c.evs, c.skipped = events.Read(f)
+	c.evsDropped = 0
 	return nil
 }
 
 // SetEvents replaces the loaded events (tests, and callers that read the log
 // themselves).
-func (c *Console) SetEvents(evs []events.Event) { c.evs = evs }
+func (c *Console) SetEvents(evs []events.Event) {
+	c.evs, c.evsDropped = evs, 0
+}
 
 func (c *Console) now() time.Time {
 	if c.Now != nil {
@@ -87,6 +94,9 @@ func (c *Console) Banner() {
 	fmt.Fprintf(c.Out.W, "%s: %d events from %d agents", events.Clean(c.Path, 120), len(c.evs), len(agents))
 	if c.skipped > 0 {
 		fmt.Fprintf(c.Out.W, " (%d unreadable lines skipped)", c.skipped)
+	}
+	if c.evsDropped > 0 {
+		fmt.Fprintf(c.Out.W, " (%d older events dropped, the last %d kept)", c.evsDropped, maxTailEvents)
 	}
 	fmt.Fprintln(c.Out.W)
 }
@@ -242,12 +252,16 @@ func (c *Console) Tail(ctx context.Context, f Filter) error {
 		case <-tick.C:
 		}
 		if fi, err := os.Stat(c.Path); err == nil && fi.Size() < off {
-			// Truncated or replaced: start again from the top.
+			// Truncated or replaced: start again from the top, and forget what
+			// was loaded from the old file. Keeping it meant summary counted
+			// every pre-rotation agent, connect and canary trip twice, with
+			// nothing on screen to say so.
 			_ = fh.Close()
 			if fh, err = os.Open(c.Path); err != nil {
 				return err
 			}
 			off, partial = 0, nil
+			c.evs, c.evsDropped = nil, 0
 		}
 		for {
 			n, err := fh.ReadAt(buf, off)
@@ -255,25 +269,48 @@ func (c *Console) Tail(ctx context.Context, f Filter) error {
 				off += int64(n)
 				partial = append(partial, buf[:n]...)
 				for {
-					i := strings.IndexByte(string(partial), '\n')
+					i := bytes.IndexByte(partial, '\n')
 					if i < 0 {
 						break
 					}
-					line := partial[:i+1]
+					line := partial[:i]
 					partial = partial[i+1:]
-					evs, _ := events.Read(strings.NewReader(string(line)))
-					for _, e := range evs {
-						c.evs = append(c.evs, e)
+					if e, ok := events.ParseLine(line); ok {
+						c.appendEvent(e)
 						if f.Match(e) && e.Kind != events.KindClose {
 							c.Out.PrintEvent(e, true)
 						}
 					}
+				}
+				// A program that writes bytes with no newline in them would
+				// grow this without bound; past the length events.Read refuses
+				// anyway there is no event in it to keep.
+				if len(partial) > events.MaxLine {
+					partial = partial[:0]
 				}
 			}
 			if err != nil || n < len(buf) {
 				break
 			}
 		}
+	}
+}
+
+// maxTailEvents bounds what a following console keeps in memory: the commands
+// answer from c.evs, and a session left tailing a busy log would otherwise
+// grow for its whole lifetime. Past the bound the oldest events go, and the
+// banner says how many, because a limit nobody can see is how an audit trail
+// quietly loses its beginning.
+const maxTailEvents = 50000
+
+// appendEvent adds a tailed event to the loaded ones, dropping the oldest past
+// maxTailEvents.
+func (c *Console) appendEvent(e events.Event) {
+	c.evs = append(c.evs, e)
+	if over := len(c.evs) - maxTailEvents; over > 0 {
+		copy(c.evs, c.evs[over:])
+		c.evs = c.evs[:maxTailEvents]
+		c.evsDropped += over
 	}
 }
 

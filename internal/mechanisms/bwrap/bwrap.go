@@ -279,7 +279,12 @@ func Args(o Opts) []string {
 		"--proc", "/proc",
 	)
 	for _, d := range o.ExtraRO {
-		args = append(args, "--ro-bind-try", d, d)
+		// Not --ro-bind-try: those are explicit grants (the program's own
+		// directory, a venv the user asked for), and a bind that quietly did
+		// not happen removes something the user granted, so the run dies as a
+		// confusing INDETERMINATE instead of a bind error. The --ro-bind-try
+		// above is for distro variance, where a missing /lib32 is normal.
+		args = append(args, "--ro-bind", d, d)
 	}
 	args = append(args,
 		// The one writable location, bound last so nothing above hides it.
@@ -378,7 +383,13 @@ func (m *Mechanism) Confine(ctx context.Context, w mechanism.Workdir, argv []str
 		ExtraRO: []string{binDir},
 		Env:     m.env(home, "/tmp"),
 	}
-	o.HideFiles, o.ReadOnly = mechanism.ProtectedInWorkdir(w.Path)
+	secrets, execConfig, scanErr := mechanism.ProtectedInWorkdir(w.Path)
+	if scanErr != nil {
+		// Nothing found because nothing could be read is not the same as
+		// nothing to protect: launch anyway, but say what is left open.
+		fmt.Fprintf(os.Stderr, "sandboxcheckr: scanning %s for files to protect failed (%v): .env files stay readable and git hooks stay writable\n", w.Path, scanErr)
+	}
+	o.HideFiles, o.ReadOnly = secrets, execConfig
 	if m.proxyPort != 0 {
 		argv = bridgeArgv(argv[0], m.proxyPort, ProxySocket(w.Path), argv)
 	}
@@ -828,6 +839,18 @@ func (m *Mechanism) KnownGaps() []model.Gap {
 				"files and the source itself cannot be without breaking the agent. Anything the program " +
 				"changes there runs unconfined the next time you build or test outside the sandbox. Review " +
 				"the diff before you run it.",
+		},
+		{
+			Severity: "medium",
+			Title:    "The terminal is inherited, and escape sequences act with the user's privileges",
+			Detail: "The confined process keeps the pty it was started on, so bytes it writes reach " +
+				"the terminal emulator, which acts on them as the user. OSC 52 sets the clipboard, which " +
+				"moves data out of the sandbox into whatever the user pastes next, and OSC 7 rewrites the " +
+				"terminal's idea of the working directory. Namespaces gate files and sockets, not what the " +
+				"terminal does with a byte stream, and no probe covers this path: the clipboard probe is " +
+				"macOS-only and tests the pasteboard command, not the escape sequence. Pipe the program's " +
+				"output rather than attaching a tty, or use a terminal configured to ignore OSC 52, when it " +
+				"matters.",
 		},
 		{
 			Severity: "medium",

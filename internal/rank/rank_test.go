@@ -41,7 +41,7 @@ func TestUnusableMechanismScoresZero(t *testing.T) {
 		blocked(model.ProbeNetEgressDNS),
 		blocked(model.ProbeFSWriteOutside),
 	)
-	Score(mr)
+	Score(mr, nil)
 
 	if mr.Usable {
 		t.Error("mechanism failing the positive control should be marked unusable")
@@ -57,8 +57,8 @@ func TestErroredProbesEarnNoCredit(t *testing.T) {
 	strong := available(positiveControl(model.VerdictAllowed), blocked(model.ProbeNetEgressTCP))
 	weak := available(positiveControl(model.VerdictAllowed), errored(model.ProbeNetEgressTCP))
 
-	Score(strong)
-	Score(weak)
+	Score(strong, nil)
+	Score(weak, nil)
 
 	if weak.Score != 0 {
 		t.Errorf("errored probe should earn no credit, got score %d", weak.Score)
@@ -81,8 +81,8 @@ func TestAllowedExposureScoresLowerThanBlocked(t *testing.T) {
 		allowed(model.ProbeFSReadSecrets),
 	)
 
-	Score(contained)
-	Score(leaky)
+	Score(contained, nil)
+	Score(leaky, nil)
 
 	if contained.Score <= leaky.Score {
 		t.Errorf("contained (%d) must outrank leaky (%d)", contained.Score, leaky.Score)
@@ -103,7 +103,7 @@ func TestUnavailableMechanismNotRecommended(t *testing.T) {
 		Availability: model.Availability{Status: model.StatusIndeterminate},
 		Probes:       []model.ProbeResult{positiveControl(model.VerdictAllowed), blocked(model.ProbeNetEgressTCP)},
 	}
-	Score(mr)
+	Score(mr, nil)
 
 	if mr.Score != 0 || mr.Usable {
 		t.Errorf("unavailable mechanism scored %d usable=%v, want 0/false", mr.Score, mr.Usable)
@@ -131,7 +131,7 @@ func TestApplyPicksStrongestUsable(t *testing.T) {
 		},
 	}
 
-	got, _ := Apply(reports)
+	got, _ := Apply(reports, nil)
 	if got != "strong" {
 		t.Errorf("recommended %q, want \"strong\"", got)
 	}
@@ -151,7 +151,7 @@ func TestApplyReturnsEmptyWhenNothingUsable(t *testing.T) {
 			Probes:       []model.ProbeResult{positiveControl(model.VerdictBlocked), blocked(model.ProbeNetEgressTCP)},
 		},
 	}
-	if got, _ := Apply(reports); got != "" {
+	if got, _ := Apply(reports, nil); got != "" {
 		t.Errorf("recommended %q, want empty", got)
 	}
 }
@@ -171,8 +171,8 @@ func TestSkippedProbesLeaveTheDenominator(t *testing.T) {
 		model.ProbeResult{ID: model.ProbeContainerSocket, Verdict: model.VerdictSkipped, Want: model.VerdictBlocked},
 	)
 
-	Score(full)
-	Score(withSkip)
+	Score(full, nil)
+	Score(withSkip, nil)
 
 	if full.Score != withSkip.Score {
 		t.Errorf("a skipped probe changed the score: %d vs %d", full.Score, withSkip.Score)
@@ -206,12 +206,55 @@ func TestApplyReportsNetworkVariantSeparately(t *testing.T) {
 		},
 	}
 
-	best, network := Apply(reports)
+	best, network := Apply(reports, nil)
 	if best != "strict" {
 		t.Errorf("strongest = %q, want \"strict\"", best)
 	}
 	if network != "practical" {
 		t.Errorf("network-permitting = %q, want \"practical\"", network)
+	}
+}
+
+// The control run decides which measurements count. A probe that could not
+// conclude on the bare host measures nothing anywhere, and one the bare host
+// already blocks says nothing about confinement, so neither may move a score.
+func TestScoreUsesTheBaselineControl(t *testing.T) {
+	// Both the control and the subject carry the positive control, so neither
+	// is scored unusable for an unrelated reason.
+	report := func(probes ...model.ProbeResult) *model.MechanismReport {
+		return available(append([]model.ProbeResult{positiveControl(model.VerdictAllowed)}, probes...)...)
+	}
+
+	// Blame: egress that times out on a network which drops packets errors in
+	// both runs. Charging it to the mechanism would rank the configuration that
+	// blackholes traffic below one that merely refuses.
+	blackhole := report(errored(model.ProbeNetEgressTCP), blocked(model.ProbeFSReadSecrets))
+	refusal := report(blocked(model.ProbeNetEgressTCP), blocked(model.ProbeFSReadSecrets))
+	Score(blackhole, report(errored(model.ProbeNetEgressTCP)))
+	Score(refusal, report(errored(model.ProbeNetEgressTCP)))
+	if blackhole.Score != refusal.Score {
+		t.Errorf("timed-out egress scored %d, refused egress %d; the control should excuse both",
+			blackhole.Score, refusal.Score)
+	}
+
+	// Credit: a dotfile the host already protects blocks the persistence probe
+	// with or without a sandbox, so it must not count as containment. The same
+	// results must score lower when the host was already blocking that probe.
+	hostProtected := report(blocked(model.ProbePersistence), allowed(model.ProbeNetEgressTCP))
+	Score(hostProtected, report(blocked(model.ProbePersistence)))
+	openOnHost := report(blocked(model.ProbePersistence), allowed(model.ProbeNetEgressTCP))
+	Score(openOnHost, report(allowed(model.ProbePersistence)))
+	if hostProtected.Score >= openOnHost.Score {
+		t.Errorf("a probe the host already blocked scored %d, the same result with the probe open on the host %d; "+
+			"the unearned credit was not removed", hostProtected.Score, openOnHost.Score)
+	}
+
+	// A nil control (a run where the baseline itself failed) must still score,
+	// on the old terms.
+	alone := report(blocked(model.ProbeNetEgressTCP))
+	Score(alone, nil)
+	if alone.Score != 100 {
+		t.Errorf("score without a control: %d, want 100", alone.Score)
 	}
 }
 

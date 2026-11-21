@@ -117,3 +117,33 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 func (b *syncBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buf.String() }
+
+// The classification the log and the event record show has to be the one the
+// decision used, and one walk of the pattern list has to answer both questions
+// the exported accessors answer separately.
+func TestClassifyHostAgreesWithTheAccessors(t *testing.T) {
+	list, err := NewAllowList([]string{"example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(list, false, io.Discard)
+	for _, h := range []string{
+		"is.gd", "r.jina.ai", "docs.google.com", "registry.npmjs.org", "paste.linuxiarz.pl",
+		"analysis.gd", "notgithub.com", "example.com", "api.anthropic.com",
+	} {
+		c := s.classifyHost(h)
+		if c.relay != RelayKind(h) {
+			t.Errorf("%s: memo relay %q, RelayKind %q", h, c.relay, RelayKind(h))
+		}
+		if c.onGet != RelaysOnGet(h) {
+			t.Errorf("%s: memo onGet %v, RelaysOnGet %v", h, c.onGet, RelaysOnGet(h))
+		}
+		if c.model != IsModelAPI(h) {
+			t.Errorf("%s: memo model %v, IsModelAPI %v", h, c.model, IsModelAPI(h))
+		}
+	}
+	// A cache, not a second opinion: asking twice gives the same answer.
+	if s.classifyHost("is.gd") != s.classifyHost("is.gd") {
+		t.Error("classification differed between two calls for one host")
+	}
+}

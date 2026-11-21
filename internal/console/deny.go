@@ -3,7 +3,6 @@ package console
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/events"
@@ -14,9 +13,13 @@ import (
 // proxy started with --deny-file pointing at it re-reads it within a second
 // and cuts open connections to an added host.
 //
-// The file is rewritten whole, via a temporary file and a rename, so a proxy
-// never reads half an edit. Comments and the order of the remaining lines are
-// kept.
+// The file is rewritten whole via proxy.WriteFileNoFollow: the temporary file
+// and rename mean a proxy never reads half an edit, the fsync before the rename
+// means a crash cannot leave the file zero-length (a lost write here silently
+// unblocks every host the operator cut off), and the no-follow checks mean a
+// program that can write the workdir cannot point the write at ~/.ssh by
+// replacing the directory with a symlink. Comments and the order of the
+// remaining lines are kept.
 func (c *Console) editDeny(hosts []string, add bool) error {
 	if c.DenyPath == "" {
 		return fmt.Errorf("no kill-switch file configured (--deny-file)")
@@ -86,7 +89,7 @@ func (c *Console) editDeny(hosts []string, add bool) error {
 		}
 		return nil
 	}
-	if err := writeAtomic(c.DenyPath, []byte(strings.Join(lines, "\n")+"\n")); err != nil {
+	if err := proxy.WriteFileNoFollow(c.DenyPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		return err
 	}
 	if add {
@@ -117,41 +120,21 @@ func (c *Console) showDeny() error {
 	if len(entries) == 0 {
 		fmt.Fprintln(c.Out.W, "nothing blocked")
 	}
-	for _, e := range entries {
-		fmt.Fprintf(c.Out.W, "  %s\n", events.Clean(e, 80))
+	// Print the lines as the file holds them, not ParseDenyList's normalised
+	// entries: it strips the "*." of "*.example.com", so the list showed
+	// "example.com" and "unblock example.com" then deleted the broader
+	// wildcard while the user believed they had removed something narrower.
+	for _, l := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if i := strings.IndexByte(l, '#'); i >= 0 {
+			l = l[:i]
+		}
+		if l = strings.TrimSpace(l); l != "" {
+			fmt.Fprintf(c.Out.W, "  %s\n", events.Clean(l, 80))
+		}
 	}
 	if invalid > 0 {
 		fmt.Fprintf(c.Out.W, "  (%d lines are not hostnames and are ignored)\n", invalid)
 	}
 	fmt.Fprintln(c.Out.W, c.Out.c("2", "  file: "+events.Clean(c.DenyPath, 100)))
 	return nil
-}
-
-// writeAtomic replaces path with data via a temporary file in the same
-// directory, refusing to write through a symlink.
-func writeAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to write %s: it is a symlink", path)
-	}
-	tmp, err := os.CreateTemp(dir, ".deny-*.tmp")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
 }

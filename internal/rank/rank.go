@@ -68,7 +68,8 @@ var weights = map[model.ProbeID]int{
 }
 
 // Score computes a mechanism's ranking score from its probe results and
-// annotates usability.
+// annotates usability. baseline is the same battery run unconfined, the
+// control harness.RunBaseline exists to provide; it may be nil.
 //
 // A mechanism that fails the positive control scores zero regardless of how
 // much it blocked. This is deliberate and is the main thing keeping the ranking
@@ -76,14 +77,30 @@ var weights = map[model.ProbeID]int{
 // also completely useless. Without this rule the tool would confidently
 // recommend a configuration in which the user's program cannot run.
 //
+// The control is what makes the rest of the arithmetic fair. A probe that
+// ERRORED on the bare host measures nothing anywhere, so it leaves the
+// denominator like a skipped probe does; charging it to the mechanism would
+// rank the sandbox that blackholes egress below one that merely refuses,
+// because a network that drops rather than rejects errors every egress probe.
+// And a probe the bare host already blocks says nothing about confinement:
+// crediting it would award the mechanism points for a dotfile's mode bits or
+// for Terminal.app lacking Full Disk Access.
+//
 // proc.exec carries zero weight rather than being omitted, because for a coding
 // agent blocking exec makes the sandbox unusable rather than safer. It is
 // reported for context, not scored.
-func Score(mr *model.MechanismReport) {
+func Score(mr *model.MechanismReport, baseline *model.MechanismReport) {
 	if mr.Availability.Status != model.StatusPass {
 		mr.Score = 0
 		mr.Usable = false
 		return
+	}
+
+	control := map[model.ProbeID]model.Verdict{}
+	if baseline != nil {
+		for _, p := range baseline.Probes {
+			control[p.ID] = p.Verdict
+		}
 	}
 
 	usable := true
@@ -110,6 +127,9 @@ func Score(mr *model.MechanismReport) {
 
 		w, ok := weights[p.ID]
 		if !ok || w == 0 {
+			continue
+		}
+		if control[p.ID] == model.VerdictErrored || control[p.ID] == model.VerdictBlocked {
 			continue
 		}
 		switch p.Verdict {
@@ -156,9 +176,9 @@ func Score(mr *model.MechanismReport) {
 // work, and the predictable response is to disable the network rule by hand and
 // lose the protection that mattered most. So the tool names both and states the
 // cost of each.
-func Apply(reports []model.MechanismReport) (recommended, recommendedNetwork string) {
+func Apply(reports []model.MechanismReport, baseline *model.MechanismReport) (recommended, recommendedNetwork string) {
 	for i := range reports {
-		Score(&reports[i])
+		Score(&reports[i], baseline)
 	}
 
 	sort.SliceStable(reports, func(i, j int) bool {

@@ -28,6 +28,14 @@ const ProbeSubcommand = "__probe"
 // sandbox for our purposes, and we must not hang with it.
 const runTimeout = 45 * time.Second
 
+// ioDrainDelay bounds the wait for the child's stdout and stderr after it has
+// been killed. Killing the sandboxed process does not close the pipes for a
+// grandchild that inherited the write end, and the battery spawns several:
+// pbpaste, dscacheutil and osascript all outlive their parent's death notice on
+// the seatbelt path. Without this, Wait blocked on the copy forever and
+// runTimeout did not actually bound a hanging sandbox.
+const ioDrainDelay = 5 * time.Second
+
 // Harness runs the battery inside candidate sandboxes.
 type Harness struct {
 	// SelfPath is the absolute path to this executable, re-executed as the
@@ -170,10 +178,17 @@ func (h *Harness) Run(ctx context.Context, m mechanism.Mechanism) ([]model.Probe
 	}
 	for i := range results {
 		if results[i].ID == model.ProbeCanaryDetection {
-			if len(probeSrv.Trips()) > 0 {
+			// The child can report the canary probe for a configuration this
+			// harness started no proxy for, and dereferencing the absent server
+			// would take the whole run down with it.
+			if probeSrv != nil && len(probeSrv.Trips()) > 0 {
 				results[i].Verdict = model.VerdictAllowed
 				results[i].Err = ""
 				results[i].Detail = "the confined child reached a canary hostname and the proxy recorded and denied the trip"
+			} else if probeSrv == nil {
+				results[i].Verdict = model.VerdictErrored
+				results[i].Detail = "canary detection is unverified on this host: this " +
+					"configuration started no egress proxy to record a trip"
 			} else {
 				results[i].Verdict = model.VerdictErrored
 				results[i].Detail = "canary detection is unverified on this host: the proxy recorded no trip"
@@ -273,6 +288,7 @@ func runChild(cmd *exec.Cmd) ([]model.ProbeResult, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = ioDrainDelay
 
 	runErr := cmd.Run()
 

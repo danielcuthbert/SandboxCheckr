@@ -64,8 +64,13 @@ func runBridge(args []string) int {
 	defer cancel()
 	// The runner may put this bridge in its own network namespace (so the
 	// DNS relay can bind port 53 unprivileged); a fresh namespace starts with
-	// the interface down, and nothing binds until it is up.
-	bridge.EnsureLoopback()
+	// the interface down, and nothing binds until it is up. Without it every
+	// connection the sandbox makes fails, so say so and stop rather than
+	// serve a listener nobody can reach.
+	if err := bridge.EnsureLoopback(); err != nil {
+		fmt.Fprintf(os.Stderr, "bridge: %v — the sandbox's loopback is not usable, so nothing inside it can reach the proxy\n", err)
+		return 1
+	}
 	ready := make(chan struct{})
 	errc := make(chan error, 1)
 	go func() {
@@ -94,7 +99,18 @@ func runBridge(args []string) int {
 		return 127
 	}
 	go func() {
+		// The channel holds one queued signal, so a second Ctrl-C while the
+		// first is still waiting would be dropped and nothing would escalate:
+		// a child that ignores SIGINT would then be unkillable from the
+		// terminal. Count them, and let the next one of any kind be the
+		// request to stop rather than to ask again.
+		n := 0
 		for s := range sigs {
+			n++
+			if n > 1 {
+				_ = cmd.Process.Kill()
+				continue
+			}
 			_ = cmd.Process.Signal(s)
 		}
 	}()

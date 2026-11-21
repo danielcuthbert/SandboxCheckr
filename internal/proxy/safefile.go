@@ -65,8 +65,8 @@ func OpenAppendNoFollow(path string, perm os.FileMode) (*os.File, error) {
 // needed, without following a symlink at the file or its parent directory.
 //
 // It writes a fresh temporary file (created exclusively, so it cannot be a
-// planted link) and renames it into place; rename replaces a symlink rather
-// than writing through it.
+// planted link), syncs it, and renames it into place; rename replaces a symlink
+// rather than writing through it.
 func WriteFileNoFollow(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -85,6 +85,13 @@ func WriteFileNoFollow(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	// The rename is durable only if the data is: a crash just after a
+	// replacement can otherwise leave the file zero-length, which for the
+	// callers that write a policy file means a policy silently gone.
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}

@@ -176,7 +176,10 @@ canary hosts, the kill switch, the allow-list — and only then resolves it on
 the host, where the resolver actually lives. One exception: a lookup of an
 external canary token (`--canary-token`) is forwarded rather than refused, so
 the token service's nameserver sees it; see the canary section. The sandbox never sees your
-resolver or a route to it, and no UDP leaves the namespace.
+resolver or a route to it, and no DNS query leaves the namespace except through
+the proxy. The relay answers UDP and TCP alike on port 53, so a resolver that
+retries over TCP when an answer comes back truncated gets the same gated answer
+instead of a dead socket.
 
 A lookup is a signal as well as a prerequisite: a query name can carry data,
 so it is gated like everything else that leaves the sandbox. Refused lookups
@@ -500,6 +503,13 @@ hostname gets you the Thinkst email as well as the trip. Kinds whose alert
 needs their protocol to reach the token service (a SQL Server, MySQL,
 kubeconfig or web bug token, say) get it too: the connection that carries the
 protocol is forwarded, so the vendor email fires and the trip is recorded.
+Forwarding is not trusting the address: the token host is resolved and vetted
+like every other destination, so a token whose name resolves to loopback, an
+internal network or the cloud metadata endpoint is refused (the trip is still
+recorded, because the name was used). A token service you host yourself in
+private space needs `--allow-private-host <token-host>` as well, which is the
+same flag any internal destination needs, and says in the run's configuration
+that you meant it.
 
 Some kinds hand you a string instead of a hostname: an AWS key pair, a card
 number. Pass those as `name=value` (`--canary-token 'aws-keys=AKIA...'`),
@@ -507,9 +517,12 @@ repeatable, or as a `canary-token` project entry. There is nothing to forward:
 the token is the string, so SandboxCheckr watches for it in request lines and
 bodies and denies its use at high confidence. That local trip is the
 detection: the token service's email cannot fire, because the value never
-leaves the sandbox. Spaces and dashes are removed from a value (card numbers
-are written both ways) and what remains must be plain token characters,
-because the value travels through the runner's shell.
+leaves the sandbox. A token has to arrive as one word: spaces, quotes and shell
+metacharacters are refused at the flag, because the value travels through the
+runner's shell and a token that split into words would arrive as arguments to
+the token command instead. Paste a card number without spaces (dashes are
+removed for you, so `4111-1111-1111-1111` is fine), and what remains must be
+plain token characters.
 
 The `canary.detection` probe verifies that a confined child can trigger a
 recorded proxy trip. No trip during an agent run does not mean it was clean:

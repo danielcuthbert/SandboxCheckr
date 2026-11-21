@@ -43,8 +43,10 @@ var fdaCanaries = []string{
 // opt-in.
 var tccUserFolders = []string{"Desktop", "Documents", "Downloads"}
 
-func tccProbes(h home, userFolders bool) []model.ProbeResult {
-	out := []model.ProbeResult{probeFullDiskAccess(h), probeKeychainService()}
+// tccProbes runs the macOS privacy probes. ctx carries the battery's network
+// budget, which bounds the security tool it runs as well as any socket.
+func tccProbes(ctx context.Context, h home, userFolders bool) []model.ProbeResult {
+	out := []model.ProbeResult{probeFullDiskAccess(h), probeKeychainService(ctx)}
 	if userFolders {
 		out = append(out, probeUserFolders(h))
 	}
@@ -173,10 +175,10 @@ func probeUserFolders(h home) model.ProbeResult {
 // (most generic passwords and API tokens stored by CLI tools) is readable the
 // same way. The lookup names a service that cannot exist, so no secret is
 // touched and no access prompt is raised.
-func probeKeychainService() model.ProbeResult {
+func probeKeychainService(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeExfilBrokerKeychain, Want: model.VerdictBlocked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password",
 		"-s", "sandboxcheckr-probe-nonexistent-0000").CombinedOutput()

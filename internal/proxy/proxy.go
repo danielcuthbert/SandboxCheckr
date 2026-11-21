@@ -27,6 +27,45 @@ import (
 // dialTimeout bounds an upstream connection attempt.
 const dialTimeout = 10 * time.Second
 
+// lookupTimeout bounds a host-side resolution. A stalled resolver must not be
+// able to pin a handler goroutine on the sandbox's behalf: the confined
+// program chooses the names.
+const lookupTimeout = 5 * time.Second
+
+// headerReadTimeout bounds reading the first request line and headers from an
+// accepted connection. Once we are relaying there is deliberately no idle
+// deadline: an agent streams a model response for minutes over one tunnel, and
+// cutting it would break the work, so the concurrency bound below is what
+// limits how many goroutines a program can hold open.
+const headerReadTimeout = 30 * time.Second
+
+// maxConns and maxDNSConns bound concurrent handlers. The proxy and its DNS
+// relay are reachable from inside the sandbox by design (that is how egress is
+// mediated), so an unbounded accept loop is a resource limit the confined
+// program controls. Beyond the bound a connection is closed with a line in the
+// log rather than silently dropped.
+const (
+	maxConns    = 1024
+	maxDNSConns = 64
+)
+
+// maxStats, maxTrips and maxLabels bound the host-side bookkeeping a confined
+// program can drive. Denied destinations are counted too, so without a cap a
+// loop over invented hostnames allocates a Stat (and its Methods map) each in
+// the unconfined proxy.
+const (
+	maxStats    = 4096
+	maxTrips    = 256
+	maxLabels   = 16
+	overflowKey = "*overflow*"
+)
+
+// lookupResolver resolves destination names on the host side. A net.Resolver
+// is used rather than the package-level LookupIP so the call can carry a
+// context deadline: the confined program chooses the name, so it must not be
+// able to pin a handler goroutine by naming one the resolver never answers for.
+var lookupResolver = new(net.Resolver)
+
 // UploadWarnBytes is the bytes-sent-upstream level at which a host is flagged.
 // Package installs, API calls and git fetches send little upstream; a host
 // receiving megabytes is being written to — an upload, a message board, or
@@ -66,6 +105,11 @@ type Server struct {
 	mu          sync.Mutex
 	stats       map[string]*Stat
 	trips       []Trip
+	tripOver    int
+	statOver    int
+	clsMu       sync.Mutex
+	cls         map[string]classification
+	denyErr     string
 	matcherOnce sync.Once
 	matcher     *canary.Matcher
 	ln          net.Listener
@@ -118,6 +162,33 @@ func (s *Server) Trips() []Trip {
 	return append([]Trip(nil), s.trips...)
 }
 
+// TripOverflow reports how many trips were dropped because Trips had reached
+// its bound. A confined program can trip a canary as often as it likes; the
+// bound keeps the host-side list from growing at its pace, and this is how a
+// reader knows the list is a window rather than the whole story.
+func (s *Server) TripOverflow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tripOver
+}
+
+// StatsOverflow reports how many distinct destinations were folded into the
+// overflow row rather than given their own Stat.
+func (s *Server) StatsOverflow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statOver
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) canaryMatcher() *canary.Matcher {
 	if s.Canaries == nil {
 		return nil
@@ -126,11 +197,29 @@ func (s *Server) canaryMatcher() *canary.Matcher {
 	return s.matcher
 }
 
-func (s *Server) trip(c canary.Credential, host, port, method, confidence string) {
+// trip records a canary use. denied says whether the request was also
+// refused: a forwarded external token is a trip without a refusal, and
+// counting it as denied would make the exit summary report a forwarded
+// connection as blocked.
+func (s *Server) trip(c canary.Credential, host, port, method, confidence string, denied bool) {
 	t := Trip{RunID: s.Canaries.RunID, Label: c.Label, Confidence: confidence, Host: host, Port: port, Method: method}
-	s.count(host, port, func(st *Stat) { st.Denied++; st.CanaryTrips++; st.CanaryLabels = append(st.CanaryLabels, c.Label) })
+	s.count(host, port, func(st *Stat) {
+		if denied {
+			st.Denied++
+		}
+		st.CanaryTrips++
+		// The same token trips on every request to its host; the label list is
+		// a set with a bound, not a history.
+		if len(st.CanaryLabels) < maxLabels && !containsString(st.CanaryLabels, c.Label) {
+			st.CanaryLabels = append(st.CanaryLabels, c.Label)
+		}
+	})
 	s.mu.Lock()
-	s.trips = append(s.trips, t)
+	if len(s.trips) < maxTrips {
+		s.trips = append(s.trips, t)
+	} else {
+		s.tripOver++
+	}
 	s.mu.Unlock()
 	s.logf("CANARY TRIPPED [%s] %s %s:%s  %s (run %s)", confidence, method, host, port, c.Label, t.RunID)
 	s.event(events.Event{Kind: events.KindCanary, Decision: events.Deny, Host: host, Port: port,
@@ -160,6 +249,19 @@ func (s *Server) scanVisible(req *http.Request, host, port string, client io.Wri
 	}
 	m := s.canaryMatcher()
 	var visible bytes.Buffer
+	// One allocation for the whole visible view rather than a regrowth per
+	// header: this runs for every request the proxy can read.
+	size := len(req.Method) + len(req.Host) + 2
+	if req.URL != nil {
+		size += len(req.URL.Path) + len(req.URL.RawQuery) + len(req.URL.Host) + len(req.URL.Scheme)
+	}
+	for k, values := range req.Header {
+		size += len(k)
+		for _, v := range values {
+			size += len(v)
+		}
+	}
+	visible.Grow(size)
 	visible.WriteString(req.Method)
 	visible.WriteByte(' ')
 	visible.WriteString(req.URL.String())
@@ -190,7 +292,7 @@ func (s *Server) scanVisible(req *http.Request, host, port string, client io.Wri
 		if c.Host == host && !c.External {
 			confidence = "medium"
 		}
-		s.trip(c, host, port, req.Method, confidence)
+		s.trip(c, host, port, req.Method, confidence, true)
 		return c, true
 	}
 	return canary.Credential{}, false
@@ -228,7 +330,8 @@ func (s *Server) noteWrite(host, port, method, path string) {
 
 // NewServer constructs a proxy.
 func NewServer(allow *AllowList, observe bool, logw io.Writer) *Server {
-	return &Server{Allow: allow, Observe: observe, Log: logw, stats: map[string]*Stat{}, live: map[net.Conn]string{}}
+	return &Server{Allow: allow, Observe: observe, Log: logw, stats: map[string]*Stat{},
+		cls: map[string]classification{}, live: map[net.Conn]string{}}
 }
 
 // Listen binds to loopback. Binding to 127.0.0.1 rather than all interfaces is
@@ -291,6 +394,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		go s.acceptDNS(ctx)
 	}
 
+	conns := make(chan struct{}, maxConns)
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
@@ -301,7 +405,22 @@ func (s *Server) Serve(ctx context.Context) error {
 				return err
 			}
 		}
-		go s.handle(ctx, conn)
+		// The proxy is reachable from inside the sandbox by design, so the
+		// number of handlers is a limit the confined program would otherwise
+		// own. Over the bound the connection is closed and said so in the log:
+		// a program that legitimately needs a thousand concurrent connections
+		// will see it, and refusing quietly would look like a broken network.
+		select {
+		case conns <- struct{}{}:
+		default:
+			s.logf("DENY  (too many concurrent connections; over the %d limit)", maxConns)
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer func() { <-conns }()
+			s.handle(ctx, conn)
+		}()
 	}
 }
 
@@ -331,24 +450,67 @@ func (s *Server) Stats() []Stat {
 	return out
 }
 
-func (s *Server) stat(host, port string) *Stat {
+// AggregateHost labels the row carrying the counts of every destination past
+// maxStats. Exported because whoever prints the rows must show it as its own
+// line: it is not a host name, and a filter that keeps only well-formed hosts
+// would drop the counts of everything it stands for.
+const AggregateHost = "many other destinations"
+
+// count updates the bookkeeping for one host:port, creating it on first sight.
+// Distinct destinations are bounded because denied names are counted as well
+// as allowed ones: without a cap a confined program looping over invented
+// hostnames allocates a Stat and its Methods map each, in the unconfined
+// proxy. Past maxStats the counts for new destinations fall into one row.
+func (s *Server) count(host, port string, f func(*Stat)) {
+	// Classification walks the relay and model-API pattern lists. Do it before
+	// taking the lock, so building a fresh Stat does not re-enter it.
+	c := s.classifyHost(host)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := host + ":" + port
 	st, ok := s.stats[k]
 	if !ok {
-		st = &Stat{Host: host, Port: port, Methods: map[string]int{},
-			Relay: RelayKind(host), RelaysOnGet: RelaysOnGet(host)}
-		s.stats[k] = st
+		if len(s.stats) >= maxStats {
+			s.statOver++
+			st, ok = s.stats[overflowKey]
+			if !ok {
+				st = &Stat{Host: AggregateHost, Port: "-", Methods: map[string]int{}}
+				s.stats[overflowKey] = st
+			}
+		} else {
+			st = &Stat{Host: host, Port: port, Methods: map[string]int{},
+				Relay: c.relay, RelaysOnGet: c.onGet}
+			s.stats[k] = st
+		}
 	}
-	return st
+	f(st)
 }
 
-func (s *Server) count(host, port string, f func(*Stat)) {
-	st := s.stat(host, port)
-	s.mu.Lock()
-	f(st)
-	s.mu.Unlock()
+// classification is what the pattern lists say about one host.
+type classification struct {
+	relay string
+	onGet bool
+	model bool
+}
+
+// classifyHost answers the pattern-list questions about a host once per host.
+// The lists run to over a hundred entries and were being walked again for
+// every log line, event and decision on the connection.
+func (s *Server) classifyHost(host string) classification {
+	s.clsMu.Lock()
+	c, ok := s.cls[host]
+	s.clsMu.Unlock()
+	if ok {
+		return c
+	}
+	kind, onGet := classify(host)
+	c = classification{relay: kind, onGet: onGet, model: IsModelAPI(host)}
+	s.clsMu.Lock()
+	if len(s.cls) < maxStats {
+		s.cls[host] = c
+	}
+	s.clsMu.Unlock()
+	return c
 }
 
 // event records e, filling in what the proxy knows about its host.
@@ -356,9 +518,10 @@ func (s *Server) event(e events.Event) {
 	if s.Events == nil {
 		return
 	}
-	e.Relay = RelayKind(e.Host)
-	e.Fetcher = RelaysOnGet(e.Host)
-	e.ModelAPI = IsModelAPI(e.Host)
+	c := s.classifyHost(e.Host)
+	e.Relay = c.relay
+	e.Fetcher = c.onGet
+	e.ModelAPI = c.model
 	if e.RunID == "" && s.Canaries != nil {
 		e.RunID = s.Canaries.RunID
 	}
@@ -375,11 +538,17 @@ func (s *Server) logf(format string, args ...any) {
 func (s *Server) handle(ctx context.Context, client net.Conn) {
 	defer client.Close()
 
+	// Bound only the reading of the request line and headers. Once the request
+	// has been judged, relaying is deliberately left without an idle deadline:
+	// an agent streams a model response for minutes over one connection, and an
+	// idle timeout there would break the work the sandbox exists to allow.
+	_ = client.SetReadDeadline(time.Now().Add(headerReadTimeout))
 	br := bufio.NewReader(client)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
+	_ = client.SetReadDeadline(time.Time{})
 
 	if req.Method == http.MethodConnect {
 		s.handleConnect(ctx, client, req)
@@ -396,13 +565,14 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 func (s *Server) decide(host, port, method string) (string, bool) {
 	s.count(host, port, func(st *Stat) { st.Conns++ })
 	note := ""
-	if k := RelayKind(host); k != "" {
-		note = "  [can store/forward: " + k + "]"
-		if RelaysOnGet(host) {
-			note = "  [relays on a plain GET: " + k + "]"
+	c := s.classifyHost(host)
+	if c.relay != "" {
+		note = "  [can store/forward: " + c.relay + "]"
+		if c.onGet {
+			note = "  [relays on a plain GET: " + c.relay + "]"
 		}
 	}
-	if IsModelAPI(host) {
+	if c.model {
 		note += "  [model API: receives whatever the agent reads]"
 	}
 	deny := func(why string) (string, bool) {
@@ -419,11 +589,11 @@ func (s *Server) decide(host, port, method string) (string, bool) {
 				// intended use, not a leak of it, so forward it and let the
 				// token service alert. The trip is recorded either way.
 				forward = true
-				s.trip(c, host, port, method, "high")
+				s.trip(c, host, port, method, "high", false)
 				s.logf("ALLOW %s:%s  [external canary token]", host, port)
 				s.event(events.Event{Kind: events.KindConnect, Decision: events.Allow, Host: host, Port: port, Reason: "external canary token (forwarded)"})
 			} else {
-				s.trip(c, host, port, method, "medium")
+				s.trip(c, host, port, method, "medium", true)
 				s.event(events.Event{Kind: events.KindConnect, Decision: events.Deny, Host: host, Port: port, Reason: "canary credential"})
 				return "", false
 			}
@@ -434,9 +604,16 @@ func (s *Server) decide(host, port, method string) (string, bool) {
 		if entry, hit := s.Deny.Match(host); hit {
 			return deny("in deny file (" + entry + ")")
 		}
-		// Dialled by name: the token host is outside the allow-list, so its
-		// addresses were never checked against the private-address guard.
-		return net.JoinHostPort(host, port), true
+		// Vetted like every other destination. The token host sits outside the
+		// allow-list by design, so nothing else has checked where it resolves:
+		// dialling the name would let a token host that points at loopback or
+		// the metadata endpoint have this unconfined process fetch it for the
+		// sandbox. --allow-private-host covers a self-hosted token service.
+		addrs, why, ok := s.resolveAndVet(host, port)
+		if !ok {
+			return deny(why)
+		}
+		return addrs, true
 	}
 	// The kill switch comes first and holds in observe mode too: it exists to
 	// take access away, so nothing else may give it back.
@@ -462,16 +639,9 @@ func (s *Server) decide(host, port, method string) (string, bool) {
 		permitted = false
 	}
 
-	// Resolve here rather than letting the dialer do it, so the resulting
-	// addresses can be checked before any connection is made.
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return deny("resolution failed")
-	}
-	for _, ip := range ips {
-		if err := s.Allow.CheckHostAddr(host, ip); err != nil {
-			return deny(err.Error())
-		}
+	addrs, why, ok := s.resolveAndVet(host, port)
+	if !ok {
+		return deny(why)
 	}
 
 	if permitted {
@@ -482,13 +652,30 @@ func (s *Server) decide(host, port, method string) (string, bool) {
 		s.event(events.Event{Kind: events.KindConnect, Decision: events.Observe, Host: host, Port: port,
 			Reason: "not in allow-list"})
 	}
-	// Every resolved address passed the guard; return them all so the dialer
-	// can fall back (IPv6 first on a host without IPv6 routing, say).
-	addrs := make([]string, len(ips))
-	for i, ip := range ips {
-		addrs[i] = net.JoinHostPort(ip.String(), port)
+	return addrs, true
+}
+
+// resolveAndVet resolves host on the host side and refuses it unless every
+// address passes the private-address guard, returning the literals to dial.
+// Resolution is bounded: the confined program chooses the name, and a resolver
+// that never answers must not pin a handler goroutine here.
+func (s *Server) resolveAndVet(host, port string) (addrs string, why string, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	ips, err := lookupResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return "", "resolution failed", false
 	}
-	return strings.Join(addrs, ","), true
+	for _, ip := range ips {
+		if err := s.Allow.CheckHostAddr(host, ip); err != nil {
+			return "", err.Error(), false
+		}
+	}
+	out := make([]string, len(ips))
+	for i, ip := range ips {
+		out[i] = net.JoinHostPort(ip.String(), port)
+	}
+	return strings.Join(out, ","), "", true
 }
 
 // dialAny connects to the first reachable of the comma-separated addresses
@@ -600,7 +787,7 @@ func (s *Server) inspect(ctx context.Context, client net.Conn, host, port, upstr
 	for {
 		req, err := http.ReadRequest(br)
 		if err != nil {
-			s.finish(host, port, atomic.LoadInt64(&cr.n), 0)
+			s.finish(host, port, cr.n, 0)
 			return
 		}
 		s.count(host, port, func(st *Stat) { st.Methods[req.Method]++ })
@@ -642,7 +829,7 @@ func (s *Server) inspect(ctx context.Context, client net.Conn, host, port, upstr
 		resp.Body.Close()
 		s.count(host, port, func(st *Stat) { st.Received += rc.n })
 		if err != nil || resp.Close || req.Close {
-			s.finish(host, port, atomic.LoadInt64(&cr.n), 0)
+			s.finish(host, port, cr.n, 0)
 			return
 		}
 	}
@@ -754,8 +941,12 @@ func (s *Server) ListenDNS(path string) error {
 	return nil
 }
 
-// acceptDNS serves the DNS relay socket until the context is cancelled.
+// acceptDNS serves the DNS relay socket until the context is cancelled. The
+// bridge keeps one connection for the run's lifetime, so the bound is generous
+// for it and a limit on anything else inside the sandbox that opens the socket
+// directly, which it can: the private directory is bind-mounted in.
 func (s *Server) acceptDNS(ctx context.Context) {
+	conns := make(chan struct{}, maxDNSConns)
 	for {
 		c, err := s.dnsLn.Accept()
 		if err != nil {
@@ -765,9 +956,23 @@ func (s *Server) acceptDNS(ctx context.Context) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		go s.handleDNS(ctx, c)
+		select {
+		case conns <- struct{}{}:
+		default:
+			_ = c.Close()
+			continue
+		}
+		go func() {
+			defer func() { <-conns }()
+			s.handleDNS(ctx, c)
+		}()
 	}
 }
+
+// frameReadTimeout bounds reading one framed query from a relay connection.
+// The connection itself stays open between queries for the run's lifetime, so
+// the deadline covers a frame in progress rather than the idle gap.
+const frameReadTimeout = 30 * time.Second
 
 // handleDNS serves one bridge relay connection: a sequence of framed queries,
 // one response each, in order. The framing is a 4-byte big-endian length plus
@@ -777,6 +982,7 @@ func (s *Server) handleDNS(ctx context.Context, c net.Conn) {
 	br := bufio.NewReader(c)
 	var lenBuf [4]byte
 	for {
+		_ = c.SetReadDeadline(time.Now().Add(frameReadTimeout))
 		if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 			return
 		}
@@ -785,9 +991,13 @@ func (s *Server) handleDNS(ctx context.Context, c net.Conn) {
 			return
 		}
 		query := make([]byte, n)
+		_ = c.SetReadDeadline(time.Now().Add(frameReadTimeout))
 		if _, err := io.ReadFull(br, query); err != nil {
 			return
 		}
+		// Answering can take as long as the resolver allows, so the deadline is
+		// not held across the gate or the relay to the host resolver.
+		_ = c.SetReadDeadline(time.Time{})
 		resp := s.answerDNS(ctx, query)
 		out := make([]byte, 4+len(resp))
 		binary.BigEndian.PutUint32(out, uint32(len(resp)))
@@ -821,10 +1031,10 @@ func (s *Server) answerDNS(ctx context.Context, query []byte) []byte {
 				// token service's own nameserver, so forward the query and
 				// answer normally. The trip is recorded either way.
 				forward = true
-				s.trip(c, name, "53", "DNS", "high")
+				s.trip(c, name, "53", "DNS", "high", false)
 				s.dnsEvent(name, qtype, events.Allow, "external canary token (forwarded)")
 			} else {
-				s.trip(c, name, "53", "DNS", "medium")
+				s.trip(c, name, "53", "DNS", "medium", true)
 				s.dnsEvent(name, qtype, events.Deny, "canary credential")
 				return dnsError(query, dnsRCODERefused)
 			}
@@ -1060,11 +1270,30 @@ func (s *Server) watchDeny(ctx context.Context) {
 		case <-t.C:
 		}
 		changed, err := s.Deny.Refresh()
-		if err != nil || !changed {
+		if err != nil {
+			// The kill switch is a security control. If the file has been
+			// replaced by something unreadable, the list in force is the last
+			// good one and the operator believes hosts are blocked: say so once
+			// per distinct failure rather than freezing silently.
+			if msg := err.Error(); msg != s.denyErr {
+				s.denyErr = msg
+				s.logf("DENYFILE re-read failed, keeping the previous list: %v", err)
+			}
 			continue
 		}
+		if !changed {
+			continue
+		}
+		s.denyErr = ""
 		entries, invalid := s.Deny.Entries()
-		s.logf("DENYFILE reloaded: %d hosts%s", len(entries), map[bool]string{true: fmt.Sprintf(", %d invalid lines ignored", invalid)}[invalid > 0])
+		extra := ""
+		if invalid > 0 {
+			extra = fmt.Sprintf(", %d invalid lines ignored", invalid)
+		}
+		if truncated := s.Deny.Truncated(); truncated {
+			extra += ", TRUNCATED at 1 MiB: hosts past that are not enforced"
+		}
+		s.logf("DENYFILE reloaded: %d hosts%s", len(entries), extra)
 		var cut []net.Conn
 		var hosts []string
 		s.mu.Lock()
@@ -1117,6 +1346,10 @@ func pipe(client, server net.Conn) (sent, recv int64) {
 	return atomic.LoadInt64(&sent), atomic.LoadInt64(&recv)
 }
 
+// countingReader and countingWriter tally bytes on one connection. Each is
+// used by a single goroutine and read only by that goroutine, so the plain
+// field is enough; the two directions of a CONNECT tunnel, which really are two
+// goroutines, use their own atomics (see pipe).
 type countingReader struct {
 	r io.Reader
 	n int64
@@ -1124,7 +1357,7 @@ type countingReader struct {
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	atomic.AddInt64(&c.n, int64(n))
+	c.n += int64(n)
 	return n, err
 }
 

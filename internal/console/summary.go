@@ -30,7 +30,7 @@ func Verdict(a AgentSummary) string {
 		return VerdictUpload
 	case a.GetRelaysReached > 0:
 		return VerdictReached
-	case a.RetriedAfterDenial || a.RelayDeny >= 2:
+	case a.RetriedAfterDenial || a.RelayDenyHosts >= 2:
 		return VerdictProbing
 	case a.Writes > 0:
 		return VerdictWrote
@@ -418,12 +418,18 @@ func findings(evs []events.Event, agents []AgentSummary) []Finding {
 		out = append(out, Finding{1, fmt.Sprintf("%s relays on a plain GET (%s) and is in the allow-list; reached by %s",
 			h, kind[h], joinAgents(reachedBy[h])), "events host=" + h})
 	}
-	// Probing, most refusals first.
+	// Probing, most doors refused first. The count is of distinct hosts: an
+	// agent that knocked twice on one closed door tried one relay, not two.
 	probing := append([]AgentSummary(nil), agents...)
-	sort.SliceStable(probing, func(i, j int) bool { return probing[i].RelayDeny > probing[j].RelayDeny })
+	sort.SliceStable(probing, func(i, j int) bool {
+		if probing[i].RelayDenyHosts != probing[j].RelayDenyHosts {
+			return probing[i].RelayDenyHosts > probing[j].RelayDenyHosts
+		}
+		return probing[i].RelayDeny > probing[j].RelayDeny
+	})
 	for _, a := range probing {
-		if a.RetriedAfterDenial || a.RelayDeny >= 2 {
-			out = append(out, Finding{2, fmt.Sprintf("%s was refused at %d relays and kept trying others", a.Agent, a.RelayDeny),
+		if a.RetriedAfterDenial || a.RelayDenyHosts >= 2 {
+			out = append(out, Finding{2, fmt.Sprintf("%s was refused at %d relays and kept trying others", a.Agent, a.RelayDenyHosts),
 				"agent " + a.Agent})
 		}
 	}

@@ -53,6 +53,17 @@ func runCanary(args []string) int {
 		if *file == "" || *dir == "" || *mount == "" {
 			return 2
 		}
+		// The rule `run` applies, applied here as well: the tokens arrive on
+		// this command line from CANARY_TOKENS_FLAGS, expanded unquoted by the
+		// runner, and --dir, --file and --mount write wherever they are
+		// pointed. A token that reads as a flag must not reach this parser,
+		// whoever assembled the list.
+		for _, token := range tokens {
+			if err := canary.ValidToken(token); err != nil {
+				fmt.Fprintln(os.Stderr, "--token:", err)
+				return 2
+			}
+		}
 		s, err := canary.New(*pass, *extra, *mount)
 		if err == nil {
 			err = s.AddExternal(tokens)

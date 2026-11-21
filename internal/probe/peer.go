@@ -1,12 +1,15 @@
 package probe
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +57,10 @@ type peerChannel struct {
 	// Returning inconclusive=true means the channel could not be evaluated
 	// here, which must never be rendered as isolation.
 	observe func(token string) (carried bool, inconclusive bool, err error)
+	// planted is true when the observer can only answer once the signaller has
+	// written something: until the parent knows the signaller got that far, a
+	// "not carried" answer measures the signaller rather than the sandbox.
+	planted bool
 }
 
 // peerRoot is the shared location candidates are built under. /tmp is used
@@ -74,23 +81,35 @@ func tempRoot() string {
 func peerChannels() []peerChannel {
 	return []peerChannel{
 		{
-			id:     "file.content",
-			name:   "shared file contents",
-			detail: "one peer can write a file the other reads, which is a full message channel",
+			id:      "file.content",
+			name:    "shared file contents",
+			planted: true,
+			detail:  "one peer can write a file the other reads, which is a full message channel",
 			signal: func(token string) error {
 				return os.WriteFile(filepath.Join(peerRoot, "sandboxcheckr-peer-"+token), []byte(token), 0o600)
 			},
 			observe: func(token string) (bool, bool, error) {
 				b, err := os.ReadFile(filepath.Join(peerRoot, "sandboxcheckr-peer-"+token))
+				if errors.Is(err, os.ErrNotExist) {
+					// The peer never got as far as writing the file, so nothing
+					// here tested whether the read is allowed. Reporting that
+					// as isolation would score a crashed signaller as a sandbox
+					// that works.
+					return false, true, nil
+				}
 				if err != nil {
+					// The file is there and we could not read it: a sandbox
+					// refusal among other causes. Any of them closes the
+					// channel from this side.
 					return false, false, nil
 				}
 				return strings.TrimSpace(string(b)) == token, false, nil
 			},
 		},
 		{
-			id:   "dir.name",
-			name: "directory names",
+			id:      "dir.name",
+			name:    "directory names",
+			planted: true,
 			detail: "one peer can encode data in directory names the other lists — this survives " +
 				"wiping file contents, and is how agents in the 2026 OpenAI–Hugging Face incident " +
 				"rebuilt their message board after it was wiped",
@@ -111,9 +130,10 @@ func peerChannels() []peerChannel {
 			},
 		},
 		{
-			id:     "unix.socket",
-			name:   "unix domain socket",
-			detail: "one peer can bind a socket the other connects to, giving a live bidirectional channel",
+			id:      "unix.socket",
+			name:    "unix domain socket",
+			planted: true,
+			detail:  "one peer can bind a socket the other connects to, giving a live bidirectional channel",
 			signal: func(token string) error {
 				p := filepath.Join(peerRoot, "scr-"+token+".sock")
 				_ = os.Remove(p)
@@ -144,12 +164,30 @@ func peerChannels() []peerChannel {
 				}
 				c, err := net.DialTimeout("unix", p, dialTimeout)
 				if err != nil {
+					// A refusal is the sandbox closing the channel. A timeout or
+					// any other failure is not evidence of that, and scoring it
+					// as isolation would be the same mistake the network probes
+					// were fixed for.
+					if v, _, _ := classifyNet(err); v != model.VerdictBlocked {
+						return false, true, err
+					}
 					return false, false, nil
 				}
 				defer c.Close()
+				// A foreign listener that accepts and never answers would
+				// otherwise hang the observing peer until the harness kills it.
+				_ = c.SetDeadline(time.Now().Add(dialTimeout))
 				buf := make([]byte, len(token))
-				n, _ := io.ReadFull(c, buf)
-				return string(buf[:n]) == token, false, nil
+				n, rerr := io.ReadFull(c, buf)
+				if string(buf[:n]) == token {
+					return true, false, nil
+				}
+				if rerr != nil {
+					// Reachable, but nothing came back to compare: inconclusive
+					// rather than a channel we proved shut.
+					return false, true, rerr
+				}
+				return false, false, nil
 			},
 		},
 		{
@@ -166,19 +204,58 @@ func peerChannels() []peerChannel {
 				if runtime.GOOS != "linux" {
 					return false, true, nil
 				}
-				entries, err := os.ReadDir("/proc")
-				if err != nil {
-					return false, false, nil
-				}
-				others := 0
-				for _, e := range entries {
-					if e.IsDir() && e.Name() != "self" && isNumeric(e.Name()) {
-						others++
-					}
-				}
-				return others > 2, false, nil
+				return procTable("/proc", token)
 			},
 		},
+	}
+}
+
+// procTable looks for the peer's token in the command lines under procRoot. The
+// root is a parameter so the judgement below can be tested without a process
+// table arranged to match it.
+//
+// Counting how many processes exist and guessing from that scores the host's
+// process count, not the sandbox: on a minimal container the unconfined
+// baseline has two or fewer, and the report claimed isolation for something it
+// never tested. The signaller's argv carries the token, so the peer is either
+// visible or it is not.
+func procTable(procRoot, token string) (carried bool, inconclusive bool, err error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		// No readable process table is not an empty one; say so rather than let
+		// it read as isolation.
+		return false, true, err
+	}
+	others, seen := 0, false
+	self := os.Getpid()
+	for _, e := range entries {
+		if !e.IsDir() || !isNumeric(e.Name()) {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		others++
+		cmdline, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "cmdline"))
+		if err != nil {
+			// A process we cannot read is not proof the peer was not one of
+			// them, but it is still another process to have looked at.
+			continue
+		}
+		if bytes.Contains(cmdline, []byte(token)) {
+			seen = true
+		}
+	}
+	switch {
+	case seen:
+		return true, false, nil
+	case others == 0:
+		// Nothing but this process was listed, so there was no peer table to
+		// look at and no answer either way.
+		return false, true, nil
+	default:
+		return false, false, nil
 	}
 }
 

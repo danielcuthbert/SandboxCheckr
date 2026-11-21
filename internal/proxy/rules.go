@@ -77,12 +77,23 @@ func (r HostRule) Permits(req *http.Request) (bool, string) {
 		p := req.URL.Path
 		// Reject traversal outright rather than trying to normalise it: a
 		// server may resolve ".." or encoded separators differently from us.
-		if strings.Contains(p, "..") || strings.Contains(strings.ToLower(req.URL.RawPath), "%2f") {
+		// %2e is the encoded dot, without which %2e%2e walks up.
+		lowerRaw := ""
+		if req.URL.RawPath != "" {
+			lowerRaw = strings.ToLower(req.URL.RawPath)
+		}
+		if strings.Contains(p, "..") || lowerRaw != "" &&
+			(strings.Contains(lowerRaw, "%2f") || strings.Contains(lowerRaw, "%2e")) {
 			return false, "path contains traversal or encoded separators"
 		}
 		ok := false
 		for _, pre := range r.paths {
-			if strings.HasPrefix(p, pre) {
+			// A prefix matches at a path boundary only. Prefix matching alone
+			// let --rule host:GET,/acme admit /acmeevil and /acme-secret, which
+			// matters because a path rule is the only thing separating "trust
+			// this code host" from "fetch anyone's payload" (SBX-011).
+			base := strings.TrimSuffix(pre, "/")
+			if p == base || strings.HasPrefix(p, base+"/") {
 				ok = true
 				break
 			}

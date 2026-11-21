@@ -58,6 +58,10 @@ func (r Rule) Matches(host string) bool {
 	return host == r.pattern
 }
 
+// String is the normalised pattern the rule matches on: lower-cased, with a
+// wildcard written in its dot form (.example.com) rather than as typed
+// (*.example.com). HostRule.String is the opposite choice, deliberately: a
+// host rule is shown back to the person who typed the method and path list.
 func (r Rule) String() string { return r.pattern }
 
 // AllowList decides which destinations may be reached.
@@ -191,6 +195,12 @@ func isRestrictedIP(ip net.IP) bool {
 	}
 	if ip4 := ip.To4(); ip4 != nil {
 		switch {
+		case ip4[0] == 0:
+			// "This host on this network". IsUnspecified only catches
+			// 0.0.0.0 itself, and on a host where 0/8 is routed locally (an
+			// old kernel, or a VPN that installs it) an allow-listed name
+			// answering 0.1.2.3 would reach a host service.
+			return true
 		case ip4[0] == 10:
 			return true
 		case ip4[0] == 172 && ip4[1]&0xf0 == 16:
@@ -203,11 +213,35 @@ func isRestrictedIP(ip net.IP) bool {
 			return true
 		case ip4[0] == 127:
 			return true
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0: // IETF protocol assignments
+			return true
+		case ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19): // benchmarking
+			return true
+		case ip4[0] >= 240: // reserved, including the limited broadcast address
+			return true
 		}
 		return false
 	}
 	// IPv6 unique-local.
-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+	if len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc {
+		return true
+	}
+	// Transition and special-purpose ranges that only mean anything when a
+	// tunnel route exists, which is exactly when they can reach something the
+	// guard is supposed to refuse. The prefixes below are written as they are
+	// registered, so the byte tests are the hex groups they spell.
+	if ip16 := ip.To16(); ip16 != nil {
+		switch {
+		case ip16[0] == 0x20 && ip16[1] == 0x02: // 2002::/16, 6to4 embeds an IPv4 address
+			return true
+		case ip16[0] == 0x20 && ip16[1] == 0x01 && ip16[2] == 0x00 && ip16[3] == 0x00: // 2001::/32, Teredo embeds one too
+			return true
+		case ip16[0] == 0x01 && ip16[1] == 0x00 && ip16[2] == 0x00 && ip16[3] == 0x00 &&
+			ip16[4] == 0x00 && ip16[5] == 0x00: // 100::/64, discard-only
+			return true
+		}
+	}
+	return false
 }
 
 // SplitHostPort separates a CONNECT target, defaulting the port.

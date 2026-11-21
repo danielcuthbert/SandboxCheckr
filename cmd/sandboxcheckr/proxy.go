@@ -158,6 +158,47 @@ func runProxy(args []string) int {
 		fmt.Fprintln(os.Stderr, "--canary-kill requires --canaries and --canary-pid-file")
 		return 2
 	}
+	// Same checks `run` makes. An entry that can never match is worse than a
+	// rejected one: the user sees unexplained DENYs and the documented way out
+	// is --observe or --allow-private, so a typo buys a policy downgrade.
+	for i, host := range allows {
+		if strings.HasPrefix(host, "*.") {
+			host = host[1:]
+		}
+		if !proxy.ValidHostname(strings.TrimPrefix(host, ".")) {
+			fmt.Fprintf(os.Stderr, "--allow: invalid hostname %q\n", allows[i])
+			return 2
+		}
+		if _, err := proxy.ParseRule(allows[i]); err != nil {
+			fmt.Fprintln(os.Stderr, "--allow:", err)
+			return 2
+		}
+	}
+	for _, port := range ports {
+		if !proxy.ValidPort(port) {
+			fmt.Fprintf(os.Stderr, "--allow-port: invalid port %q\n", port)
+			return 2
+		}
+	}
+	for _, host := range privHosts {
+		if strings.HasPrefix(host, "*.") {
+			host = host[1:]
+		}
+		if !proxy.ValidHostname(strings.TrimPrefix(host, ".")) {
+			fmt.Fprintf(os.Stderr, "--allow-private-host: invalid hostname %q\n", host)
+			return 2
+		}
+	}
+	for _, r := range rules {
+		if !safeProxyWord(r) {
+			fmt.Fprintf(os.Stderr, "--rule: unsupported shell characters in %q\n", r)
+			return 2
+		}
+		if _, err := proxy.ParseHostRule(r); err != nil {
+			fmt.Fprintln(os.Stderr, "--rule:", err)
+			return 2
+		}
+	}
 
 	patterns := effectiveAllowPatterns(allows, *observe, *denyAll)
 	if len(allows) == 0 && !*observe && !*denyAll {
@@ -235,7 +276,11 @@ func runProxy(args []string) int {
 		if label == "" {
 			label = fmt.Sprintf("proxy-%d", os.Getpid())
 		}
-		srv.Events = events.NewWriter(f, label)
+		w := events.NewWriter(f, label)
+		// A dropped event is lost evidence, and nothing else would say so: the
+		// proxy keeps deciding happily while a full disk swallows the record.
+		w.Log = os.Stderr
+		srv.Events = w
 	}
 
 	if len(ruled) > 0 {
@@ -362,7 +407,15 @@ func runProxy(args []string) int {
 			printCanarySummary(os.Stderr, srv.Canaries.RunID, trips)
 		}
 	}
-	printSummary(os.Stderr, srv.Stats(), list, *observe)
+	printSummary(os.Stderr, srv.Stats(), list, *observe, srv.StatsOverflow())
+	if srv.Events != nil {
+		// The summary is read as a complete account of the run. It is not, if
+		// the log could not be written, and that has to be said here rather
+		// than left for someone to discover while reading the file.
+		if n := srv.Events.Dropped(); n > 0 {
+			fmt.Fprintf(os.Stderr, "\nEVENTS — %d event(s) could not be written to %s: the log is incomplete\n", n, *eventsPath)
+		}
+	}
 	if len(trips) > 0 {
 		return 3
 	}
@@ -408,7 +461,7 @@ func writeBundle(path string, ca []byte) error {
 // printSummary reports what was contacted, per host:port, and ends with an
 // allow-list a reader can paste. Port is kept separate from host because
 // enforcing a non-web port needs --allow-port: merging them hid that.
-func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observe bool) {
+func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observe bool, overflow int) {
 	if len(stats) == 0 {
 		fmt.Fprintln(w, "\nno destinations were contacted")
 		return
@@ -419,7 +472,16 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 	// a user pastes into a shell (command substitution).
 	valid := stats[:0:0]
 	invalid := 0
-	for _, s := range stats {
+	var aggregate *proxy.Stat
+	for i, s := range stats {
+		if s.Host == proxy.AggregateHost {
+			// The bucket every destination past the row limit falls into. It is
+			// not a host name, so it has to be taken out before the filter or
+			// the counts for everything it stands for vanish from the one place
+			// anyone reads them.
+			aggregate = &stats[i]
+			continue
+		}
 		if proxy.ValidHostname(s.Host) && proxy.ValidPort(s.Port) {
 			valid = append(valid, s)
 		} else {
@@ -478,6 +540,15 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 		if s.Port != "443" && s.Port != "80" {
 			extraPorts[s.Port] = true
 		}
+	}
+	if aggregate != nil {
+		note := "counted together"
+		if overflow > 0 {
+			note = fmt.Sprintf("counted together: %d further destinations past the row limit", overflow)
+		}
+		fmt.Fprintf(w, "  %-*s %6d %6d %10s %10s  %s\n", hw, aggregate.Host+":"+aggregate.Port,
+			aggregate.Conns, aggregate.Denied,
+			proxy.HumanBytes(aggregate.Sent), proxy.HumanBytes(aggregate.Received), note)
 	}
 	if invalid > 0 {
 		fmt.Fprintf(w, "  (%d destinations with malformed host names or ports omitted)\n", invalid)

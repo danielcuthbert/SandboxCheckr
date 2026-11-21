@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -321,6 +322,52 @@ func TestBindPortsForExcludesBridgePortAndDuplicates(t *testing.T) {
 	if got := bindPortsFor(nil); got != nil {
 		t.Fatalf("bindPortsFor(nil) = %v, want nil", got)
 	}
+}
+
+// A canary token is expanded unquoted by the runner, so the flag has to refuse
+// the ones that would arrive as several words, read as an option, or name a
+// destination the unconfined proxy would have to fetch for the sandbox.
+func TestRunRejectsTokensThatAreNotOneWord(t *testing.T) {
+	project := t.TempDir()
+	for _, tok := range []string{
+		"card=4111 1111 1111 1111",
+		"$(id).canarytokens.com",
+		"-allow=evil.com",
+		"169.254.169.254",
+		"localhost",
+	} {
+		code, out := withStderr(t, func() int {
+			return runSandbox([]string{"--workdir", project, "--canary-token", tok, foundCommand(t)})
+		})
+		if code != 2 {
+			t.Errorf("--canary-token %q: exit %d, want 2", tok, code)
+		}
+		if !strings.Contains(out, "--canary-token") {
+			t.Errorf("--canary-token %q was refused for some other reason: %s", tok, out)
+		}
+	}
+}
+
+// withStderr runs f with os.Stderr captured, so a rejection can be pinned to
+// the message that produced it rather than to a status code many paths give.
+func withStderr(t *testing.T, f func() int) (int, string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	got := make(chan string, 1)
+	go func() {
+		var b bytes.Buffer
+		_, _ = b.ReadFrom(r)
+		got <- b.String()
+	}()
+	code := f()
+	_ = w.Close()
+	os.Stderr = old
+	return code, <-got
 }
 
 func TestParseBindPorts(t *testing.T) {

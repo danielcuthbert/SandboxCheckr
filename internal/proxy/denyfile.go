@@ -34,6 +34,9 @@ type DenyFile struct {
 	exists  bool
 	entries []string
 	invalid int
+	// truncated says the file was cut off at maxDenyFileBytes, so hosts past
+	// that point are not enforced.
+	truncated bool
 }
 
 // maxDenyFileBytes caps how much of the file is read.
@@ -54,16 +57,23 @@ func NewDenyFile(path string) (*DenyFile, error) {
 func (d *DenyFile) Path() string { return d.path }
 
 // Refresh re-reads the file if it changed since the last read, reporting
-// whether it did.
+// whether it did. The stat, the read and the parse all happen without the lock
+// held: Match is on the path of every connection and every relayed query, so a
+// reload must not be able to stall the decision path behind a file read.
 func (d *DenyFile) Refresh() (bool, error) {
-	fi, err := os.Stat(d.path)
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	same := d.exists
+	mt, sz := d.modTime, d.size
+	d.mu.Unlock()
+
+	fi, err := os.Stat(d.path)
 	if os.IsNotExist(err) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 		if !d.exists {
 			return false, nil
 		}
-		d.exists, d.entries, d.invalid = false, nil, 0
+		d.exists, d.entries, d.invalid, d.truncated = false, nil, 0, false
 		return true, nil
 	}
 	if err != nil {
@@ -72,7 +82,7 @@ func (d *DenyFile) Refresh() (bool, error) {
 	if !fi.Mode().IsRegular() {
 		return false, fmt.Errorf("deny file %s is not a regular file", d.path)
 	}
-	if d.exists && fi.ModTime().Equal(d.modTime) && fi.Size() == d.size {
+	if same && fi.ModTime().Equal(mt) && fi.Size() == sz {
 		return false, nil
 	}
 	f, err := os.Open(d.path)
@@ -80,13 +90,22 @@ func (d *DenyFile) Refresh() (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxDenyFileBytes))
+	// One byte past the cap is read so that hitting the cap is observable: the
+	// file is append-mostly, so the entry lost to truncation is the one someone
+	// added last, which is the opposite of what a kill switch should do quietly.
+	data, err := io.ReadAll(io.LimitReader(f, maxDenyFileBytes+1))
 	if err != nil {
 		return false, err
 	}
+	truncated := len(data) > maxDenyFileBytes
+	if truncated {
+		data = data[:maxDenyFileBytes]
+	}
 	entries, invalid := ParseDenyList(data)
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.exists, d.modTime, d.size = true, fi.ModTime(), fi.Size()
-	d.entries, d.invalid = entries, invalid
+	d.entries, d.invalid, d.truncated = entries, invalid, truncated
 	return true, nil
 }
 
@@ -145,4 +164,16 @@ func (d *DenyFile) Entries() ([]string, int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]string(nil), d.entries...), d.invalid
+}
+
+// Truncated reports whether the last read hit the size cap, meaning hosts
+// listed past that point are not enforced. The caller logs it: a kill switch
+// that silently stops covering the list is worse than one that fails loudly.
+func (d *DenyFile) Truncated() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.truncated
 }

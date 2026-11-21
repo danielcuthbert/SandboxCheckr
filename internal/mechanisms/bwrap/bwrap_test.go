@@ -20,10 +20,20 @@ func TestBindsFollowHomeTmpfs(t *testing.T) {
 	if tmpfs < 0 {
 		t.Fatal("/home must be replaced with a tmpfs")
 	}
-	for _, pair := range [][2]string{{"--ro-bind-try", "/home/u/bin"}, {"--bind", "/home/u/proj"}, {"--dir", "/home/u"}} {
+	for _, pair := range [][2]string{{"--ro-bind", "/home/u/bin"}, {"--bind", "/home/u/proj"}, {"--dir", "/home/u"}} {
 		if i := indexPair(args, pair[0], pair[1]); i < tmpfs {
 			t.Errorf("%s %s at %d must come after --tmpfs /home at %d", pair[0], pair[1], i, tmpfs)
 		}
+	}
+	// An explicit grant binds or the run fails: --ro-bind-try would let a
+	// missing grant pass, and the program then dies on something the user
+	// believes they granted.
+	if indexPair(args, "--ro-bind-try", "/home/u/bin") >= 0 {
+		t.Error("an explicit read-only grant must not use --ro-bind-try")
+	}
+	// Distro variance is the opposite: a distro without /lib32 is normal.
+	if indexPair(args, "--ro-bind-try", "/lib32") < 0 {
+		t.Error("the distro-variance binds must tolerate a missing directory")
 	}
 }
 

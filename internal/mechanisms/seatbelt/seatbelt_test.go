@@ -350,12 +350,16 @@ func TestConcurrentRunnersGetSeparateProxies(t *testing.T) {
 	stub := filepath.Join(dir, "fake-sbx")
 	_ = os.WriteFile(stub, []byte("#!/bin/sh\necho \"$HTTPS_PROXY\"\nsleep 1\n"), 0o755)
 	script := strings.ReplaceAll(art.FileBody, "/usr/bin/sandbox-exec", stub)
+	// The runner pins its own binary at emit time, so point the pinned default
+	// at the built binary this test supplies; the poisoned SANDBOXCHECKR below
+	// is what the pin has to ignore.
+	script = pinRunnerBinary(t, script, bin)
 	_ = os.WriteFile(filepath.Join(dir, "run.sh"), []byte(script), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "seatbelt-proxy.sb"), []byte(art.ExtraFiles["seatbelt-proxy.sb"]), 0o600)
 
 	run := func() *exec.Cmd {
 		c := exec.Command("/bin/sh", filepath.Join(dir, "run.sh"), "/bin/echo")
-		c.Env = append(os.Environ(), "SANDBOXCHECKR="+bin)
+		c.Env = append(os.Environ(), "SANDBOXCHECKR=/nonexistent/sandboxcheckr")
 		return c
 	}
 	a, b := run(), run()
@@ -412,6 +416,166 @@ func TestRunnerRefusesRootAndHomeGrants(t *testing.T) {
 	if out, _ := run("EXTRA_RO=" + ok); strings.Contains(out, "refusing") {
 		t.Errorf("ordinary EXTRA_RO path refused:\n%s", out)
 	}
+}
+
+// pinRunnerBinary rewrites the binary the emitted runner pins, the way
+// re-emitting from a different build would.
+func pinRunnerBinary(t *testing.T, script, bin string) string {
+	t.Helper()
+	const marker = "SANDBOXCHECKR_DEFAULT="
+	i := strings.Index(script, marker)
+	if i < 0 {
+		t.Fatal("the runner does not record a default binary to pin")
+	}
+	rest := script[i+len(marker):]
+	end := strings.Index(rest, "\n")
+	if end < 0 {
+		t.Fatal("the pinned binary is not a line of its own")
+	}
+	return script[:i+len(marker)] + shQuote(bin) + rest[end:]
+}
+
+// The runner starts the egress proxy and the canary generator OUTSIDE the
+// sandbox, so the binary it runs has to be the one emitted with the profile. An
+// inherited SANDBOXCHECKR would otherwise run attacker-chosen code unconfined,
+// which is why the bubblewrap runner pins it too.
+func TestRunnerPinsItsOwnBinary(t *testing.T) {
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(art.FileBody, "${SANDBOXCHECKR:-") {
+		t.Errorf("the environment must not be able to choose the runner's binary:\n%s", art.FileBody)
+	}
+	if !strings.Contains(art.FileBody, `SANDBOXCHECKR="$SANDBOXCHECKR_DEFAULT"`) {
+		t.Errorf("the runner must pin SANDBOXCHECKR to the emitted default:\n%s", art.FileBody)
+	}
+}
+
+// SBX-011: the dotenv and exec-config deny blocks sit in the .sb between
+// ;; BEGIN / ;; END markers; the runner cuts them out of the main text and
+// re-applies them after the EXTRA_* grants. A profile whose blocks are missing
+// (hand-edited, damaged) would leave PROTECT empty, so the blocks would be gone
+// from both places and .env would be readable with nothing printed. Failing
+// closed is the only safe answer, and an explicit opt-out still runs.
+func TestRunnerFailsClosedWhenProtectionBlocksAreMissing(t *testing.T) {
+	dir := t.TempDir()
+	work := t.TempDir()
+	art, err := NewStrict().Wrapper(mechanism.Workdir{Path: work})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbName := NewStrict().ID() + ".sb"
+	profile := art.ExtraFiles[sbName]
+	for _, marker := range []string{beginDotenv, beginExecConfig} {
+		if !strings.Contains(profile, marker) {
+			t.Fatalf("the emitted profile must carry %q:\n%s", marker, profile)
+		}
+	}
+	// sandbox-exec is replaced by a stub that records the profile it was
+	// handed, so the ordering of the re-applied blocks is checkable and the
+	// test does not need a working Seatbelt.
+	stub := filepath.Join(dir, "fake-sandbox-exec")
+	handed := filepath.Join(dir, "handed-over.sb")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$2\" > "+shQuote(handed)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "run.sh")
+	body := strings.ReplaceAll(art.FileBody, "/usr/bin/sandbox-exec", stub)
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(profileText string, env ...string) (string, int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, sbName), []byte(profileText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(handed)
+		cmd := exec.Command("/bin/sh", script, "/usr/bin/true")
+		cmd.Env = append([]string{"HOME=" + dir, "PATH=/usr/bin:/bin"}, env...)
+		out, err := cmd.CombinedOutput()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return string(out), ee.ExitCode()
+		}
+		if err != nil {
+			t.Fatalf("running the runner: %v\n%s", err, out)
+		}
+		return string(out), 0
+	}
+
+	out, code := run(profile, "EXTRA_RW="+work)
+	if code != 0 {
+		t.Fatalf("the intact profile would not run: exit %d\n%s", code, out)
+	}
+	handedText, err := os.ReadFile(handed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := string(handedText)
+	deny := "(deny file-read-data file-write* file-link"
+	if !strings.Contains(applied, deny) {
+		t.Errorf("the .env deny is missing from the profile handed to sandbox-exec:\n%s", applied)
+	}
+	// Seatbelt takes the last matching rule, so the protection has to land
+	// after a grant that names the project itself.
+	realWork := work
+	if r, err := filepath.EvalSymlinks(work); err == nil {
+		realWork = r
+	}
+	grant := `(allow file-read* file-write* (subpath "` + realWork + `"))`
+	gi, di := strings.Index(applied, grant), strings.Index(applied, deny)
+	if gi < 0 {
+		t.Errorf("the EXTRA_RW grant is missing from the profile handed over:\n%s", applied)
+	} else if di >= 0 && di < gi {
+		t.Error("the workdir protection must be re-applied after EXTRA_* grants")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		drop   []string
+		wants  string
+		env    []string
+		expect bool
+	}{
+		{"both blocks gone", []string{"protect-dotenv", "protect-exec-config"}, "protect-dotenv", nil, false},
+		{"exec config block gone", []string{"protect-exec-config"}, "protect-exec-config", nil, false},
+		{"opted out", nil, "", []string{"ALLOW_DOTENV=1", "ALLOW_EXEC_CONFIG=1"}, true},
+	} {
+		broken := profile
+		for _, name := range tc.drop {
+			broken = dropBlock(broken, name)
+		}
+		out, code := run(broken, tc.env...)
+		if tc.expect {
+			if code != 0 {
+				t.Errorf("%s: opted out but the runner refused to start: exit %d\n%s", tc.name, code, out)
+			}
+			continue
+		}
+		if code != 2 || !strings.Contains(out, tc.wants) {
+			t.Errorf("%s: want exit 2 naming %q, got exit %d:\n%s", tc.name, tc.wants, code, out)
+		}
+	}
+}
+
+// dropBlock removes a protection block from a profile, markers and rules both,
+// the way a hand-edited profile or a bad merge would.
+func dropBlock(profile, name string) string {
+	var kept []string
+	skip := false
+	for _, line := range strings.Split(profile, "\n") {
+		switch {
+		case strings.HasPrefix(line, ";; BEGIN "+name):
+			skip = true
+		case strings.HasPrefix(line, ";; END "+name):
+			skip = false
+		case !skip:
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 func TestConfineRefusesBinaryInHome(t *testing.T) {

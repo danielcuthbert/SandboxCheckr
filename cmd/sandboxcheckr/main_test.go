@@ -193,7 +193,8 @@ func TestObserveSummaryOmitsMalformedHosts(t *testing.T) {
 		{Host: "$(touch /tmp/pwned).evil.com", Port: "443"},
 		{Host: "evil.com", Port: "443;id"},
 		{Host: "\x1b]0;title\x07x.com", Port: "443"},
-	}, list, true)
+		{Host: proxy.AggregateHost, Port: "-", Conns: 4100, Denied: 4099, Sent: 12, Received: 0},
+	}, list, true, 4096)
 	out := buf.String()
 	for _, bad := range []string{"$(", "touch", ";id", "\x1b"} {
 		if strings.Contains(out, bad) {
@@ -205,5 +206,12 @@ func TestObserveSummaryOmitsMalformedHosts(t *testing.T) {
 	}
 	if !strings.Contains(out, "3 destinations with malformed") {
 		t.Errorf("summary should say how many were omitted:\n%s", out)
+	}
+	// The overflow row is not a host name, so the filter above must not take it
+	// with the malformed ones: it is the only record of where the rest of the
+	// run went.
+	if !strings.Contains(out, proxy.AggregateHost) || !strings.Contains(out, "4099") ||
+		!strings.Contains(out, "4096 further destinations") {
+		t.Errorf("combined destinations missing:\n%s", out)
 	}
 }

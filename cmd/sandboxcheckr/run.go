@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/danielcuthbert/sandboxcheckr/internal/canary"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
@@ -257,6 +258,16 @@ func runSandbox(args []string) int {
 			return 2
 		}
 	}
+	// Tokens reach the runner through CANARY_TOKENS_FLAGS, which the runner
+	// expands unquoted. Every other user-supplied list is checked here for the
+	// same reason: a token that word-splits becomes extra argv for canary new,
+	// whose --dir and --file would then name a path from the project file.
+	for _, token := range o.canaryTokens {
+		if err := canary.ValidToken(token); err != nil {
+			fmt.Fprintf(os.Stderr, "--canary-token: %v\n", err)
+			return 2
+		}
+	}
 	for _, label := range []struct {
 		paths *multiFlag
 		noun  string
@@ -302,6 +313,7 @@ func runSandbox(args []string) int {
 		fmt.Fprintln(os.Stderr, "generating runner:", err)
 		return 1
 	}
+	sweepStalePrivateDirs()
 	// Absolute template: an inherited TMPDIR must not move the runner (which
 	// knows the policy) somewhere the sandboxed program can read.
 	private, err := os.MkdirTemp("/tmp", "sandboxcheckr-run-*")
@@ -320,9 +332,13 @@ func runSandbox(args []string) int {
 	// switches must not silently widen (or subvert) the new sandbox:
 	// SANDBOXCHECKR would choose which binary the runner execs, AGENT forges
 	// the event-log label, DENY_FILE/ALLOW_* change the policy, TMPDIR would
-	// move private runner state somewhere the child can see.
+	// move private runner state somewhere the child can see. CANARY_TOKENS_FLAGS
+	// and BIND_PORTS are expanded unquoted by the runner, so an inherited value
+	// would reach the child's argv, and an inherited PORT would pin two runs to
+	// one proxy, merging their allow-lists.
 	for _, name := range []string{"PASS_ENV", "EXTRA_RW", "EXTRA_RO", "ALLOW", "CANARY", "CANARY_KILL",
-		"SANDBOXCHECKR", "AGENT", "DENY_FILE", "ALLOW_DOTENV", "ALLOW_EXEC_CONFIG", "TMPDIR"} {
+		"SANDBOXCHECKR", "AGENT", "DENY_FILE", "ALLOW_DOTENV", "ALLOW_EXEC_CONFIG", "TMPDIR",
+		"CANARY_TOKENS_FLAGS", "BIND_PORTS", "PORT"} {
 		env = replaceEnv(env, name, "")
 	}
 	passNames := []string(o.passes)

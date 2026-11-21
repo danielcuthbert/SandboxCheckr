@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"context"
 	"net"
 	"os"
 	"strings"
@@ -98,6 +99,46 @@ func TestProxyHostPortStripsCredentials(t *testing.T) {
 	}
 }
 
+// The mechanism declares /tmp private. That declaration covers /tmp and nothing
+// else, so a host with a private /tmp and a genuinely shared /dev/shm must still
+// be reported as having a peer channel.
+func TestSharedScratchMarkerAppliesOnlyToTmp(t *testing.T) {
+	restoreDirs, restorePrivate := sharedScratchDirs, privateScratchDirs
+	defer func() { sharedScratchDirs, privateScratchDirs = restoreDirs, restorePrivate }()
+
+	shared := t.TempDir()
+	sharedScratchDirs = []string{"/tmp", "/private/tmp", shared}
+	privateScratchDirs = []string{"/tmp", "/private/tmp"}
+	t.Setenv("SANDBOXCHECKR_PRIVATE_TMP", "1")
+
+	r := probeSharedScratch()
+	if r.Verdict != model.VerdictAllowed {
+		t.Fatalf("the private-tmp marker hid every scratch directory: %s (%s)", r.Verdict, r.Detail)
+	}
+	if !strings.Contains(r.Detail, shared) {
+		t.Errorf("the writable shared directory should be named, got: %s", r.Detail)
+	}
+}
+
+// Where every candidate really is private, the marker must still be honoured,
+// and the report must say why nothing was found writable.
+func TestSharedScratchHonoursMarkerForTmp(t *testing.T) {
+	restoreDirs, restorePrivate := sharedScratchDirs, privateScratchDirs
+	defer func() { sharedScratchDirs, privateScratchDirs = restoreDirs, restorePrivate }()
+
+	sharedScratchDirs = []string{"/tmp", "/private/tmp"}
+	privateScratchDirs = []string{"/tmp", "/private/tmp"}
+	t.Setenv("SANDBOXCHECKR_PRIVATE_TMP", "1")
+
+	r := probeSharedScratch()
+	if r.Verdict != model.VerdictBlocked {
+		t.Fatalf("private tmp gave %s, want BLOCKED: %s", r.Verdict, r.Detail)
+	}
+	if !strings.Contains(r.Detail, "tmpfs") {
+		t.Errorf("the report should say the marker was what closed the channel, got: %s", r.Detail)
+	}
+}
+
 // Filesystem probes must leave nothing behind, since they run against real
 // directories the user cares about.
 func TestSharedScratchProbeCleansUp(t *testing.T) {
@@ -123,7 +164,7 @@ func TestSharedScratchProbeCleansUp(t *testing.T) {
 // Every exfil probe must declare BLOCKED as the healthy outcome, or the score
 // would reward an open channel.
 func TestExfilProbesWantBlocked(t *testing.T) {
-	for _, r := range RunExfilBattery(homeView(t.TempDir(), "")) {
+	for _, r := range RunExfilBattery(context.Background(), homeView(t.TempDir(), "")) {
 		if r.Want != model.VerdictBlocked {
 			t.Errorf("%s wants %s, should want BLOCKED", r.ID, r.Want)
 		}
@@ -139,7 +180,7 @@ func TestExfilProbesWantBlocked(t *testing.T) {
 func TestProxyEnvEnforcingProxyIsBlocked(t *testing.T) {
 	addr := fakeProxy(t, "HTTP/1.1 403 Forbidden\r\n\r\n")
 	t.Setenv("HTTPS_PROXY", "http://"+addr)
-	if r := probeProxyEnv(); r.Verdict != model.VerdictBlocked {
+	if r := probeProxyEnv(context.Background()); r.Verdict != model.VerdictBlocked {
 		t.Errorf("enforcing proxy gave %s, want BLOCKED: %s", r.Verdict, r.Detail)
 	}
 }
@@ -147,7 +188,7 @@ func TestProxyEnvEnforcingProxyIsBlocked(t *testing.T) {
 func TestProxyEnvRelayingProxyIsAllowed(t *testing.T) {
 	addr := fakeProxy(t, "HTTP/1.1 200 Connection established\r\n\r\n")
 	t.Setenv("HTTPS_PROXY", "http://"+addr)
-	if r := probeProxyEnv(); r.Verdict != model.VerdictAllowed {
+	if r := probeProxyEnv(context.Background()); r.Verdict != model.VerdictAllowed {
 		t.Errorf("relaying proxy gave %s, want ALLOWED: %s", r.Verdict, r.Detail)
 	}
 }
