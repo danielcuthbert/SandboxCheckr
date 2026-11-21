@@ -101,6 +101,72 @@ func TestProfileGrantsExecPath(t *testing.T) {
 	}
 }
 
+// A TUI puts its terminal in raw mode with TIOCSETA, an ioctl. Seatbelt counts
+// ioctl as an operation of its own, so granting file-read* and file-write* on
+// the device does not cover it and the program dies with EPERM before it draws
+// anything: the failure codex showed on macOS.
+func TestProfileGrantsTtyIoctl(t *testing.T) {
+	p := Profile(ProfileOpts{Workdir: "/tmp/x", TtyDevices: []string{"/dev/ttys003"}})
+	if !strings.Contains(p, `(allow file-ioctl (literal "/dev/ttys003"))`) {
+		t.Errorf("profile must grant ioctl on the terminal this run inherited:\n%s", p)
+	}
+	if !strings.Contains(p, `(allow file-ioctl (literal "/dev/tty"))`) {
+		t.Error("profile must grant ioctl on /dev/tty, which a program may open directly")
+	}
+}
+
+// The grant covers this run's terminal and nothing else. A rule over /dev/ttys*
+// would let the confined program rewrite every other terminal the user has
+// open, which is keystroke injection into shells the sandbox does not own.
+func TestProfileNeverGrantsAllTerminals(t *testing.T) {
+	for _, o := range []ProfileOpts{
+		{Workdir: "/tmp/x"},
+		{Workdir: "/tmp/x", TtyDevices: []string{"/dev/ttys003"}},
+	} {
+		p := Profile(o)
+		for _, bad := range []string{`"^/dev/ttys`, `(subpath "/dev")`, `(subpath "/dev/tty`} {
+			if strings.Contains(p, bad) {
+				t.Errorf("profile grants over terminals with %s (opts %+v)", bad, o)
+			}
+		}
+	}
+}
+
+// The device path reaches the profile as a path literal, and it arrives from a
+// symlink this tool did not create, so anything that is not a terminal device
+// directly under /dev is dropped rather than quoted in.
+func TestIsTtyDevice(t *testing.T) {
+	cases := map[string]bool{
+		"/dev/tty":        true,  // the controlling terminal device itself
+		"/dev/null":       false, // a device, but not a terminal
+		"/dev/tty/x":      false, // not directly under /dev
+		"/tmp/tty003":     false, // not in /dev at all
+		"/etc/../dev/tty": false, // same place, wrong spelling
+		"relative/tty003": false,
+		`/dev/tty"evil`:   false, // would break out of the SBPL string if it ever got in
+		"/dev/ttys003xyz": false, // does not exist as a device
+	}
+	for path, want := range cases {
+		if got := isTtyDevice(path); got != want {
+			t.Errorf("isTtyDevice(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+// The emitted runner resolves the terminal at run time, since the person
+// running the script is at a different terminal than the one that emitted it.
+func TestRunnerGrantsIoctlOnInheritedTerminal(t *testing.T) {
+	art, err := NewProxied(8899, true).Wrapper(mechanism.Workdir{Path: "/tmp/proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`/bin/readlink "/dev/fd/$_fd"`, `(allow file-ioctl (literal $(sbpl_str "$_dev")))`, `$PROFILE_TEXT$EXTRA$PROTECT$TTYEXTRA`} {
+		if !strings.Contains(art.FileBody, want) {
+			t.Errorf("runner must grant ioctl on the inherited terminal, missing %q", want)
+		}
+	}
+}
+
 // Deny must come before the allows, since later rules win in Seatbelt.
 func TestDenyDefaultPrecedesAllows(t *testing.T) {
 	p := Profile(ProfileOpts{Workdir: "/tmp/x"})

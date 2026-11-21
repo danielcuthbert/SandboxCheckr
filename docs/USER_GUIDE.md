@@ -695,6 +695,9 @@ sandboxcheckr run --canary-token abc123.canarytokens.com -- claude   # forward a
 # A sandboxcheckr.toml in the project is the baseline; flags add to or override it.
 # Python venvs (VIRTUAL_ENV, .venv, venv) are granted read-only and put first on PATH.
 # Event logs are per project; console in the same project reads that project's log.
+# A program that draws in the terminal (a TUI) has to change the terminal's own
+# settings, which the profile grants on the terminal the run is attached to: run
+# it from a terminal rather than with stdin, stdout and stderr all redirected.
 
 sandboxcheckr adopt                       # propose sandboxcheckr.toml lines from the project's event log
 sandboxcheckr adopt --write               # write or regenerate the file (never proposes canary hosts)

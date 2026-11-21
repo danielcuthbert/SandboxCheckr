@@ -230,6 +230,44 @@ func verifyGeneratedProfile(ctx context.Context, sandboxExec string, network boo
 	return msg, false
 }
 
+// inheritedTerminals returns the terminal devices this process holds on stdin,
+// stdout and stderr, for Profile's file-ioctl grant.
+//
+// Seatbelt matches the path carried on the vnode, so a rule for /dev/tty does
+// not cover the already-open /dev/ttys003 the child inherits, while a rule for
+// /dev/ttys* would cover every other terminal this user has open. Resolving the
+// three descriptors we actually hand the child is what makes the grant mean
+// "the terminal this run is on" and nothing else.
+//
+// /dev/fd/N and /dev/stdin & friends are symlinks to the device on macOS, which
+// is how tty(1) works. Anything that does not resolve to a terminal character
+// device is dropped, so a run with its output redirected adds no rule at all.
+func inheritedTerminals() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range []string{"/dev/fd/0", "/dev/fd/1", "/dev/fd/2", "/dev/stdin", "/dev/stdout", "/dev/stderr"} {
+		real, err := filepath.EvalSymlinks(p)
+		if err != nil || seen[real] || !isTtyDevice(real) {
+			continue
+		}
+		seen[real] = true
+		out = append(out, real)
+	}
+	return out
+}
+
+// isTtyDevice reports whether path is a terminal device sitting directly under
+// /dev: /dev/ttys003 yes, /dev/null and anything in a subdirectory no. The
+// path arrives from a symlink we did not create, so it is checked rather than
+// trusted: it goes into the profile as a path literal.
+func isTtyDevice(path string) bool {
+	if !strings.HasPrefix(path, "/dev/tty") || strings.LastIndexByte(path, '/') != len("/dev") {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
 // ProfileOpts parameterises the generated policy.
 type ProfileOpts struct {
 	// PermitNetwork allows egress. Off by default: the safer value is the one
@@ -256,6 +294,11 @@ type ProfileOpts struct {
 	// AllowExecConfig drops the write protection on files that other programs
 	// execute later (git hooks and config, CI workflows, editor tasks).
 	AllowExecConfig bool
+	// TtyDevices are the terminal device paths this run inherited on stdin,
+	// stdout and stderr, which is what the file-ioctl grant names. Resolve them
+	// with inheritedTerminals; a program that changes the terminal's mode needs
+	// them or dies with EPERM before printing anything.
+	TtyDevices []string
 }
 
 // Markers delimiting the workdir protection blocks in a generated profile.
@@ -435,6 +478,24 @@ func Profile(o ProfileOpts) string {
   (literal "/dev/dtracehelper")
   (literal "/dev/tty"))
 
+;; Terminal control, which Seatbelt counts as an operation of its own: the
+;; grant above does not permit TIOCGWINSZ or TIOCSETA on a device, so a TUI
+;; cannot put the terminal in raw mode and dies with EPERM before it draws
+;; anything. The real work here is done by the rules naming the terminals this
+;; run inherited, emitted below. /dev/tty itself is included because a program
+;; may open it directly, but Seatbelt matches the path on the vnode, so that
+;; path is /dev/ttys003 rather than /dev/tty, and only the inherited device
+;; list covers it. Granting /dev/ttys* instead would let the program rewrite
+;; every other terminal this user has open, which is a keystroke channel into
+;; terminals this sandbox does not own.
+(allow file-ioctl (literal "/dev/tty"))
+`)
+
+	for _, dev := range o.TtyDevices {
+		fmt.Fprintf(&b, "(allow file-ioctl (literal %q))\n", dev)
+	}
+
+	b.WriteString(`
 ;; Explicit denials for a high-value channel. deny-default already refuses this,
 ;; but stating it makes the intent auditable and keeps it denied even if a broad
 ;; allow is added later. Apple Events are cross-app automation — a confined
@@ -519,6 +580,7 @@ func (m *Mechanism) Confine(ctx context.Context, w mechanism.Workdir, argv []str
 		ExecPaths:     []string{filepath.Dir(argv[0])},
 		PermitNetwork: m.network,
 		ProxyPort:     m.proxyPort,
+		TtyDevices:    inheritedTerminals(),
 	}
 
 	// -p passes the profile inline, avoiding a temp file that would itself need
@@ -818,7 +880,22 @@ PROFILE_TEXT=$(printf '%s\n' "$PROFILE_TEXT" | sed '/^;; BEGIN protect-/,/^;; EN
 const runnerArgv = `
 shift
 set -- "$CMD_PATH" "$@"
-set -- /usr/bin/sandbox-exec -p "$PROFILE_TEXT$EXTRA$PROTECT" "$@"
+# Changing the terminal's mode is its own Seatbelt operation, separate from
+# file-read* and file-write*, so a TUI needs an ioctl grant on the terminal this
+# run inherited or it dies with EPERM before drawing. Resolve the descriptors we
+# hand the child: /dev/ttys* would also cover the user's other terminals, which
+# are shells this sandbox does not own.
+TTYEXTRA=""
+SEEN=""
+for _fd in 0 1 2; do
+  _dev=$(/bin/readlink "/dev/fd/$_fd" 2>/dev/null || true)
+  case "$_dev" in /dev/tty*) ;; *) continue ;; esac
+  case " $SEEN " in *" $_dev "*) continue ;; esac
+  SEEN="$SEEN $_dev"
+  TTYEXTRA="$TTYEXTRA
+(allow file-ioctl (literal $(sbpl_str "$_dev")))"
+done
+set -- /usr/bin/sandbox-exec -p "$PROFILE_TEXT$EXTRA$PROTECT$TTYEXTRA" "$@"
 for name in $PASS_ENV; do
   eval "val=\${$name-}"
   set -- "$name=$val" "$@"
@@ -1014,6 +1091,19 @@ func (m *Mechanism) KnownGaps() []model.Gap {
 				"sockets, not what the terminal does with a byte stream. The clipboard probe checks the " +
 				"pasteboard command (pbpaste), not this path. Pipe the program's output rather than " +
 				"attaching a tty, or use a terminal configured to ignore OSC 52 and 1337, when it matters.",
+		},
+		{
+			Severity: "medium",
+			Title:    "The program may change the settings of the terminal it runs on",
+			Detail: "A terminal program has to change the terminal's own settings to read keys a " +
+				"keystroke at a time (raw mode, echo off) and to ask for its size, and Seatbelt counts " +
+				"that as file-ioctl, a separate operation from reading and writing the device. Without " +
+				"the grant a TUI dies with EPERM before it draws anything. The profile grants it on the " +
+				"terminal this run inherited and on no other device, so the program can leave your " +
+				"terminal in a strange state when it exits, and where the OS still honours TIOCSTI it " +
+				"can also push keystrokes into the shell that launched it. The other terminals you have " +
+				"open are out of reach, which is why the rule names one resolved device instead of " +
+				"/dev/ttys*. Pipe the program's output instead of attaching a tty when that matters.",
 		},
 		{
 			Severity: "medium",
