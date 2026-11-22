@@ -42,12 +42,16 @@ func TestProxiedRunnerKeepsDecisionLogOutsideWorkdir(t *testing.T) {
 	for _, want := range []string{
 		`mktemp -d "${TMPDIR:-/tmp}/sandboxcheckr-log.XXXXXX"`,
 		`echo "$PROXY_PID" > "$HERE/.proxy-pid"`,
-		"observed connection attempts",
 		"Looked up in this shell's PATH",
 	} {
 		if !strings.Contains(art.FileBody, want) {
 			t.Errorf("proxied runner lacks %q", want)
 		}
+	}
+	// The proxy separates its own summary with section headers. A banner here
+	// too would put two headings on the same block of output.
+	if strings.Contains(art.FileBody, "observed connection attempts") {
+		t.Errorf("proxied runner echoes a summary banner:\n%s", art.FileBody)
 	}
 }
 

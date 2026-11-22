@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/canary"
+	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/events"
 	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
 )
@@ -202,7 +203,7 @@ func runProxy(args []string) int {
 
 	patterns := effectiveAllowPatterns(allows, *observe, *denyAll)
 	if len(allows) == 0 && !*observe && !*denyAll {
-		fmt.Fprintf(os.Stderr, "no --allow given; defaulting to %s\n", strings.Join(defaultAllow, ", "))
+		say("no --allow given; defaulting to %s", strings.Join(defaultAllow, ", "))
 	}
 
 	list, err := proxy.NewAllowList(patterns)
@@ -296,7 +297,7 @@ func runProxy(args []string) int {
 				return 1
 			}
 		} else {
-			fmt.Fprintln(os.Stderr, "note: --rule hosts are TLS-inspected; the client must trust this run's CA. "+
+			say("note: --rule hosts are TLS-inspected; the client must trust this run's CA. " +
 				"Use --ca-bundle-out (runner scripts do this for you).")
 		}
 	}
@@ -319,7 +320,7 @@ func runProxy(args []string) int {
 			return 1
 		}
 		defer os.Remove(*dnsUnix)
-		fmt.Fprintln(os.Stderr, "dns relay: name resolution inside the sandbox is gated by the allow-list, "+
+		say("dns relay: name resolution inside the sandbox is gated by the allow-list, " +
 			"and refusals are logged like connections")
 	}
 
@@ -336,58 +337,57 @@ func runProxy(args []string) int {
 		defer os.Remove(*readyFile)
 	}
 
+	// Everything the proxy says around the program, from here to the exit
+	// summary, is colour on the same rules as the report.
+	st := summaryStyle()
 	if *observe {
-		fmt.Fprintln(os.Stderr,
-			"OBSERVE MODE: disallowed destinations are permitted and logged. The port gate, private-address refusals and canary trips still enforce. This is NOT full enforcement.")
+		sayWarn("OBSERVE MODE: disallowed destinations are permitted and logged. The port gate, private-address refusals and canary trips still enforce. This is NOT full enforcement.")
 	} else if rules := list.Rules(); len(rules) == 0 {
-		fmt.Fprintln(os.Stderr, "enforcing allow-list: nothing (every destination is refused)")
+		say("enforcing allow-list: nothing (every destination is refused)")
 	} else {
-		fmt.Fprintf(os.Stderr, "enforcing allow-list: %s\n", strings.Join(rules, ", "))
+		say("enforcing allow-list: %s", strings.Join(rules, ", "))
 	}
 	// The rest of the configured policy, so what was configured and what was
 	// later observed (the exit summary) read as two separate things.
 	if len(ports) > 0 {
-		fmt.Fprintf(os.Stderr, "permitted ports: %s (besides 443 and 80)\n", strings.Join(ports, ", "))
+		say("permitted ports: %s (besides 443 and 80)", strings.Join(ports, ", "))
 	}
 	if len(privHosts) > 0 {
-		fmt.Fprintf(os.Stderr, "private-address hosts: %s\n", strings.Join(privHosts, ", "))
+		say("private-address hosts: %s", strings.Join(privHosts, ", "))
 	}
 	for _, r := range rules {
-		fmt.Fprintf(os.Stderr, "request rule: %s (TLS-inspected)\n", r)
+		say("request rule: %s (TLS-inspected)", r)
 	}
 	if srv.Deny != nil {
 		entries, invalid := srv.Deny.Entries()
-		fmt.Fprintf(os.Stderr, "kill switch: %s (%d hosts", srv.Deny.Path(), len(entries))
+		ignored := ""
 		if invalid > 0 {
-			fmt.Fprintf(os.Stderr, ", %d invalid lines ignored", invalid)
+			ignored = fmt.Sprintf(", %d invalid lines ignored", invalid)
 		}
-		fmt.Fprintln(os.Stderr, "; edit it to cut a host off mid-run)")
+		say("kill switch: %s (%d hosts%s; edit it to cut a host off mid-run)", srv.Deny.Path(), len(entries), ignored)
 	}
 	if *allowPrivate {
-		fmt.Fprintln(os.Stderr,
-			"WARNING: --allow-private permits private and link-local destinations for every host, "+
-				"including the cloud metadata endpoint.")
+		sayWarn("WARNING: --allow-private permits private and link-local destinations for every host, " +
+			"including the cloud metadata endpoint.")
 	}
 	for _, h := range list.Rules() {
 		bare := strings.TrimPrefix(h, ".")
 		rule, ruled := list.RuleFor(bare)
 		if k := proxy.RelayKind(h); k != "" && proxy.RelaysOnGet(h) {
-			fmt.Fprintf(os.Stderr, "WARNING: %s (%s) relays on a plain GET: it can store data or fetch "+
-				"another host, so no --rule makes it download-only. Allowing it opens a route to the "+
-				"wider internet and a message board between agents.\n", h, k)
+			sayWarn("WARNING: %s (%s) relays on a plain GET: it can store data or fetch another host, "+
+				"so no --rule makes it download-only. Allowing it opens a route to the wider internet and "+
+				"a message board between agents.", h, k)
 		} else if k != "" && !ruled {
-			fmt.Fprintf(os.Stderr, "note: %s is a %s — it can store what it is sent or fetch onward. "+
-				"Consider --rule %s so only downloads are allowed.\n", h, k, proxy.SuggestedRule(h))
+			say("note: %s is a %s — it can store what it is sent or fetch onward. Consider --rule %s "+
+				"so only downloads are allowed.", h, k, proxy.SuggestedRule(h))
 		}
 		if proxy.IsCodeHost(h) && (!ruled || !rule.HasPaths()) {
-			fmt.Fprintf(os.Stderr, "note: %s serves anyone's content. A download-only rule still lets a "+
-				"payload staged in someone else's repository in; scope it to your own with a path, "+
-				"e.g. --rule %s:GET,HEAD:/your-org/\n", h, h)
+			say("note: %s serves anyone's content. A download-only rule still lets a payload staged in "+
+				"someone else's repository in; scope it to your own with a path, e.g. --rule %s:GET,HEAD:/your-org/", h, h)
 		}
 		if proxy.IsModelAPI(h) {
-			fmt.Fprintf(os.Stderr, "note: %s is a model API. Whatever the program reads can be sent there "+
-				"in a prompt; the proxy cannot stop that. Keep secrets out of the sandbox if you do not "+
-				"trust the model.\n", h)
+			say("note: %s is a model API. Whatever the program reads can be sent there in a prompt; the "+
+				"proxy cannot stop that. Keep secrets out of the sandbox if you do not trust the model.", h)
 		}
 	}
 
@@ -401,19 +401,15 @@ func runProxy(args []string) int {
 
 	trips := srv.Trips()
 	if srv.Canaries != nil {
-		if len(srv.Canaries.Credentials) == 0 {
-			fmt.Fprintf(os.Stderr, "\nCANARY — run %s\n  No canaries planted: all groups were skipped for passed credentials or config paths.\n", srv.Canaries.RunID)
-		} else {
-			printCanarySummary(os.Stderr, srv.Canaries.RunID, trips)
-		}
+		printCanarySummary(os.Stderr, st, srv.Canaries.RunID, trips, len(srv.Canaries.Credentials) > 0)
 	}
-	printSummary(os.Stderr, srv.Stats(), list, *observe, srv.StatsOverflow())
+	printSummary(os.Stderr, st, srv.Stats(), list, *observe, srv.StatsOverflow())
 	if srv.Events != nil {
 		// The summary is read as a complete account of the run. It is not, if
 		// the log could not be written, and that has to be said here rather
 		// than left for someone to discover while reading the file.
 		if n := srv.Events.Dropped(); n > 0 {
-			fmt.Fprintf(os.Stderr, "\nEVENTS — %d event(s) could not be written to %s: the log is incomplete\n", n, *eventsPath)
+			lineBad(os.Stderr, st, "EVENTS — %d event(s) could not be written to %s: the log is incomplete", n, *eventsPath)
 		}
 	}
 	if len(trips) > 0 {
@@ -422,17 +418,28 @@ func runProxy(args []string) int {
 	return 0
 }
 
-func printCanarySummary(w io.Writer, runID string, trips []proxy.Trip) {
-	fmt.Fprintf(w, "\nCANARY — run %s\n", runID)
-	if len(trips) == 0 {
-		fmt.Fprintln(w, "  No canary was used or sent through the proxy. This does not show the run was clean:")
-		fmt.Fprintln(w, "  Unruled HTTPS hides its contents; later bytes in large bodies are not scanned; direct proxy bypass is blocked by the sandbox, but model prompts and unplanted secrets remain blind spots.")
-		return
-	}
-	for _, t := range trips {
-		fmt.Fprintf(w, "  %s  %s  %s %s:%s  — see CANARY TRIPPED in the proxy log\n",
-			strings.ToUpper(t.Confidence), events.Clean(t.Label, 40), events.Clean(t.Method, 20),
-			events.Clean(t.Host, 253), events.Clean(t.Port, 10))
+// printCanarySummary answers the question the run leaves open: did any planted
+// secret leave the sandbox. The header's note carries that answer, so a scan of
+// the summary sees it before the explanation.
+func printCanarySummary(w io.Writer, st emit.Styles, runID string, trips []proxy.Trip, planted bool) {
+	label := "run " + runID
+	fmt.Fprint(w, "\n")
+	switch {
+	case !planted:
+		section(w, st, "canary", label+", none planted")
+		note(w, st, "No canaries planted: all groups were skipped for passed credentials or config paths.")
+	case len(trips) == 0:
+		sectionNote(w, st, st.Green, "canary", label+", nothing used")
+		note(w, st, "No canary was used or sent through the run's proxy. This does not show the run was clean:")
+		note(w, st, "Unruled HTTPS hides its contents; later bytes in large bodies are not scanned; direct proxy bypass is blocked by the sandbox, but model prompts and unplanted secrets remain blind spots.")
+	default:
+		sectionNote(w, st, st.Red, "canary", fmt.Sprintf("%s, %d trip%s", label, len(trips), plural(len(trips))))
+		for _, t := range trips {
+			fmt.Fprintf(w, "  %s%s%s  %s  %s %s:%s  — see CANARY TRIPPED in the proxy log\n",
+				st.Red, strings.ToUpper(t.Confidence), st.Reset,
+				events.Clean(t.Label, 40), events.Clean(t.Method, 20),
+				events.Clean(t.Host, 253), events.Clean(t.Port, 10))
+		}
 	}
 }
 
@@ -461,9 +468,10 @@ func writeBundle(path string, ca []byte) error {
 // printSummary reports what was contacted, per host:port, and ends with an
 // allow-list a reader can paste. Port is kept separate from host because
 // enforcing a non-web port needs --allow-port: merging them hid that.
-func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observe bool, overflow int) {
+func printSummary(w io.Writer, st emit.Styles, stats []proxy.Stat, list *proxy.AllowList, observe bool, overflow int) {
 	if len(stats) == 0 {
-		fmt.Fprintln(w, "\nno destinations were contacted")
+		fmt.Fprint(w, "\n")
+		line(w, st, "no destinations were contacted")
 		return
 	}
 	// Hostnames arrive from the sandboxed program. Anything that is not a
@@ -493,12 +501,38 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 		fmt.Fprintf(w, "\nno valid destinations were contacted (%d malformed names omitted)\n", invalid)
 		return
 	}
-	fmt.Fprintln(w, "\nDestinations contacted:")
+	fmt.Fprint(w, "\n")
+	// The header counts decide whether the table needs reading: a refused
+	// destination is the only reason this summary exists.
+	distinct := map[string]bool{}
+	refused := 0
+	for _, s := range stats {
+		if s.Host != proxy.AggregateHost {
+			distinct[s.Host] = true
+		}
+		refused += s.Denied
+	}
+	n := len(distinct)
+	if refused > 0 {
+		sectionNote(w, st, st.Red, "destinations", fmt.Sprintf("%d host%s, %d refused", n, plural(n), refused))
+	} else {
+		sectionNote(w, st, st.Green, "destinations", fmt.Sprintf("%d host%s, none refused", n, plural(n)))
+	}
 	hw := len("host:port")
 	for _, s := range stats {
 		hw = max(hw, len(s.Host)+1+len(s.Port))
 	}
 	fmt.Fprintf(w, "  %-*s %6s %6s %10s %10s  %s\n", hw, "host:port", "conns", "denied", "sent", "received", "notes")
+	// A denied connection is the number worth reading, so it is the one that
+	// gets colour. It is padded before the escape goes on, so the column holds.
+	printRow := func(hostport string, conns, denied int, sent, received int64, note string) {
+		deniedCol := fmt.Sprintf("%6d", denied)
+		if denied > 0 {
+			deniedCol = st.Red + deniedCol + st.Reset
+		}
+		fmt.Fprintf(w, "  %-*s %6d %s %10s %10s  %s\n", hw, hostport, conns, deniedCol,
+			proxy.HumanBytes(sent), proxy.HumanBytes(received), note)
+	}
 	var hosts []string
 	extraPorts := map[string]bool{}
 	seenHost := map[string]bool{}
@@ -515,13 +549,13 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 			notes = append(notes, "model API")
 		}
 		if s.Sent >= proxy.UploadWarnBytes {
-			notes = append(notes, "HEAVY UPLOAD")
+			notes = append(notes, st.Yellow+"HEAVY UPLOAD"+st.Reset)
 		}
 		if s.Writes > 0 {
 			notes = append(notes, fmt.Sprintf("SENT DATA ×%d", s.Writes))
 		}
 		if s.CanaryTrips > 0 {
-			notes = append(notes, fmt.Sprintf("CANARY TRIPPED ×%d", s.CanaryTrips))
+			notes = append(notes, st.Red+fmt.Sprintf("CANARY TRIPPED ×%d", s.CanaryTrips)+st.Reset)
 		}
 		if len(s.Methods) > 0 {
 			var ms []string
@@ -531,8 +565,7 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 			sort.Strings(ms)
 			notes = append(notes, strings.Join(ms, " "))
 		}
-		fmt.Fprintf(w, "  %-*s %6d %6d %10s %10s  %s\n", hw, s.Host+":"+s.Port, s.Conns, s.Denied,
-			proxy.HumanBytes(s.Sent), proxy.HumanBytes(s.Received), strings.Join(notes, "; "))
+		printRow(s.Host+":"+s.Port, s.Conns, s.Denied, s.Sent, s.Received, strings.Join(notes, "; "))
 		if !seenHost[s.Host] && s.CanaryTrips == 0 {
 			seenHost[s.Host] = true
 			hosts = append(hosts, s.Host)
@@ -546,14 +579,13 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 		if overflow > 0 {
 			note = fmt.Sprintf("counted together: %d further destinations past the row limit", overflow)
 		}
-		fmt.Fprintf(w, "  %-*s %6d %6d %10s %10s  %s\n", hw, aggregate.Host+":"+aggregate.Port,
-			aggregate.Conns, aggregate.Denied,
-			proxy.HumanBytes(aggregate.Sent), proxy.HumanBytes(aggregate.Received), note)
+		printRow(aggregate.Host+":"+aggregate.Port, aggregate.Conns, aggregate.Denied,
+			aggregate.Sent, aggregate.Received, note)
 	}
 	if invalid > 0 {
-		fmt.Fprintf(w, "  (%d destinations with malformed host names or ports omitted)\n", invalid)
+		note(w, st, "(%d destinations with malformed host names or ports omitted)", invalid)
 	}
-	printRelayAttempts(w, stats)
+	printRelayAttempts(w, st, stats)
 
 	if !observe {
 		return
@@ -586,7 +618,7 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 	fmt.Fprintln(w, "\nReview these. To enforce exactly what was seen, run the sandbox with:")
 	// Single-quoted, so the shell expands nothing in it when pasted. Every
 	// host passed ValidHostname above, so none can contain a quote.
-	fmt.Fprintf(w, "  ALLOW='%s'\n", strings.Join(flags, " "))
+	fmt.Fprintf(w, "  %sALLOW='%s'%s\n", st.Bold, strings.Join(flags, " "), st.Reset)
 	if len(portList) > 0 {
 		fmt.Fprintln(w, "  (--allow-port applies to every allowed host, not only the one that used it.)")
 	}
@@ -595,9 +627,13 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 			"genuinely needs to publish there.")
 	}
 	if len(getRelays) > 0 {
-		fmt.Fprintf(w, "  %s relay on a plain GET, so no --rule is suggested for them: remove them from the "+
+		verb := "relay"
+		if len(getRelays) == 1 {
+			verb = "relays"
+		}
+		fmt.Fprintf(w, "  %s %s on a plain GET, so no --rule is suggested for them: remove them from the "+
 			"list unless the program genuinely needs them, and know that leaving them in opens a route "+
-			"onward.\n", strings.Join(getRelays, ", "))
+			"onward.\n", strings.Join(getRelays, ", "), verb)
 	}
 	if codeHosts {
 		fmt.Fprintln(w, "  Replace /YOUR-ORG/ with the repository paths the program really needs. A code host "+
@@ -610,7 +646,7 @@ func printSummary(w io.Writer, stats []proxy.Stat, list *proxy.AllowList, observ
 // allowed or not. A refused connection to a URL shortener or fetcher is not
 // noise: it is the program looking for a way out or a place to leave a
 // message — the first step of the 2026 swarm incidents (SWM-007).
-func printRelayAttempts(w io.Writer, stats []proxy.Stat) {
+func printRelayAttempts(w io.Writer, st emit.Styles, stats []proxy.Stat) {
 	var rows []proxy.Stat
 	for _, s := range stats {
 		if s.Relay != "" {
@@ -626,23 +662,38 @@ func printRelayAttempts(w io.Writer, stats []proxy.Stat) {
 		}
 		return rows[i].Denied > rows[j].Denied
 	})
-	fmt.Fprintln(w, "\nStore-or-forward hosts the program tried (relays, message boards, ways onward):")
+	fmt.Fprint(w, "\n")
+	refused := 0
 	for _, s := range rows {
-		status := "reached"
+		if s.Denied >= s.Conns {
+			refused++
+		}
+	}
+	head := fmt.Sprintf("%d tried", len(rows))
+	if refused > 0 {
+		sectionNote(w, st, st.Red, "store-or-forward", fmt.Sprintf("%s, %d refused", head, refused))
+	} else {
+		sectionNote(w, st, st.Yellow, "store-or-forward", head+", all reached")
+	}
+	for _, s := range rows {
+		status, statusStyle := "reached", ""
 		switch {
 		case s.Denied >= s.Conns:
-			status = "REFUSED"
+			status, statusStyle = "REFUSED", st.Red
 		case s.Denied > 0:
-			status = fmt.Sprintf("reached, %d refused", s.Denied)
+			status, statusStyle = fmt.Sprintf("reached, %d refused", s.Denied), st.Yellow
 		}
+		// Padded plain, then wrapped: the escape would count as a column
+		// otherwise and the columns would drift.
+		cell := statusStyle + fmt.Sprintf("%-22s", fmt.Sprintf("%d× %s", s.Conns, status)) + st.Reset
 		mark := " "
 		if s.RelaysOnGet {
-			mark = "!"
+			mark = st.Yellow + "!" + st.Reset
 		}
-		fmt.Fprintf(w, "  %s %-32s %-22s %s\n", mark, s.Host+":"+s.Port, fmt.Sprintf("%d× %s", s.Conns, status), s.Relay)
+		fmt.Fprintf(w, "  %s %-32s %s %s\n", mark, s.Host+":"+s.Port, cell, s.Relay)
 	}
-	fmt.Fprintln(w, "  ! relays on a plain GET: no --rule contains it.")
-	fmt.Fprintln(w, "  A program that was refused and tried another relay is probing for a route; see "+
+	note(w, st, "! relays on a plain GET: no --rule contains it.")
+	note(w, st, "A program that was refused and tried another relay is probing for a route; see "+
 		"sandboxcheckr console for the order of attempts.")
 }
 

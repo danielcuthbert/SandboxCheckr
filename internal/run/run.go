@@ -343,6 +343,14 @@ func nextSteps(rep model.Report) []model.Step {
 				Text:    "Build its allow-list from evidence: run the agent in observe mode, then review the destinations.",
 				Command: "sandboxcheckr run --observe <agent>",
 			})
+			// The destinations table only shows what reached the proxy. Where
+			// the sandbox logs its refusals, say how to see the rest.
+			if runtime.GOOS == "darwin" {
+				out = append(out, model.Step{
+					Text:    "When a program dies before it connects, ask the kernel what the sandbox refused from it.",
+					Command: "sandboxcheckr run --explain <program>",
+				})
+			}
 		}
 	}
 

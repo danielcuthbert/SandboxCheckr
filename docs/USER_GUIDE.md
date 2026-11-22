@@ -295,18 +295,25 @@ sandboxes started side by side never share an allow-list or a log. (`PORT=9000`
 fixes the port if you need to; `sandboxcheckr proxy --port N` does the same when
 running the proxy by hand.) Decisions go to a per-run log in a private
 temporary directory **outside** the workdir, where the sandboxed program can
-neither see nor edit it (`PROXY_LOG=` to choose the file); the summary is
-printed when the program exits, under its own *observed connection attempts*
-heading, after everything the program itself printed:
+neither see nor edit it (`PROXY_LOG=` to choose the file).
+
+What the proxy saw is printed when the program exits, after everything the
+program itself printed, in headed blocks: `CANARY` for the planted secrets,
+`DESTINATIONS` for every host contacted, `STORE-OR-FORWARD` for the relays the
+program tried. The count in each header says whether the block needs reading.
+Colour follows the terminal (`--no-color`, or `NO_COLOR=`, turns it off, and
+piped output is plain): red is a refusal or a trip, yellow something you may
+want to grant, green a clean block, dim context you can skip.
 
 ```
-Destinations contacted:
+── DESTINATIONS  2 hosts, 2 refused  ─────────────────────────────────────
   host:port               conns denied       sent   received  notes
-  registry.npmjs.org:443      4      2      417 B   23.7 KiB  store/forward: package registry; GET×2 MKCOL×1 PUT×1
-  api.anthropic.com:443       2      0  129.3 KiB    5.6 KiB
+  registry.npmjs.org:443      4      2      417 B   23.7 KiB  store/forward: package registry; SENT DATA ×2; GET×2 MKCOL×1 PUT×1
+  api.anthropic.com:443       2      0  129.3 KiB    5.6 KiB  model API
 
 Review these. To enforce exactly what was seen, run the sandbox with:
   ALLOW='--allow registry.npmjs.org --allow api.anthropic.com --rule registry.npmjs.org:GET,HEAD'
+  The --rule entries make store-or-forward hosts download-only; drop one if the program genuinely needs to publish there.
 ```
 
 **Registries, and the 2026 incident.** In the OpenAI–Hugging Face incident,
@@ -347,11 +354,12 @@ is allowed, suggests no rule for it, and lists every relay the program *tried*,
 reached or refused, in its own section of the summary:
 
 ```
-Store-or-forward hosts the program tried (relays, message boards, ways onward):
+── STORE-OR-FORWARD  3 tried, 2 refused  ─────────────────────────────────
   ! is.gd:443                        1× REFUSED             URL shortener
   ! r.jina.ai:443                    1× REFUSED             fetcher (fetches any URL it is given)
   ! httpbin.org:443                  1× reached             echo / redirect service
   ! relays on a plain GET: no --rule contains it.
+  A program that was refused and tried another relay is probing for a route; see sandboxcheckr console for the order of attempts.
 ```
 
 A refusal there is not noise: it is the program looking for a way out or a
@@ -392,7 +400,7 @@ sandboxcheckr run --explain codex --no-daemon
 ```
 
 ```
-── refused by the sandbox (kernel log, codex, 08:03:59 to 08:04:06) ──
+── SANDBOX REFUSALS  codex, kernel log, 08:03:59 to 08:04:06  ────────────
   count  operation         target                                            notes
        3  file-ioctl        /dev/ttys003                                      terminal control; this run did not inherit that device
        3  file-read-data    /Users/daniel/.agents/skills                      outside the workdir; add --ro <dir>

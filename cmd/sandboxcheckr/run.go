@@ -18,13 +18,11 @@ import (
 	"time"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/canary"
-	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
 	"github.com/danielcuthbert/sandboxcheckr/internal/projconfig"
 	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
-	"github.com/danielcuthbert/sandboxcheckr/internal/tty"
 )
 
 const runUsage = `sandboxcheckr run — run a command in this project's proxied sandbox
@@ -169,6 +167,11 @@ func runSandbox(args []string) int {
 			return 0
 		}
 		return 2
+	}
+	if *noColor {
+		// The exit summary is printed by this process and by the proxy the
+		// runner starts, so the switch has to reach both.
+		forceNoColor()
 	}
 	argv := fs.Args()
 	if len(argv) == 0 {
@@ -374,7 +377,7 @@ func runSandbox(args []string) int {
 			}
 			o.ro = append(o.ro, abs)
 		}
-		fmt.Fprintln(os.Stderr, "sandboxcheckr: using python venv", root, "(read-only, first on PATH)")
+		say("sandboxcheckr: using python venv %s (read-only, first on PATH)", root)
 	}
 
 	// Known agents get their state directory, without which they cannot run
@@ -397,7 +400,7 @@ func runSandbox(args []string) int {
 						return 2
 					}
 					rwPaths = append(rwPaths, path)
-					fmt.Fprintln(os.Stderr, "sandboxcheckr: granting", commandName, "state directory", path)
+					say("sandboxcheckr: granting %s state directory %s", commandName, path)
 				}
 			}
 		}
@@ -415,7 +418,7 @@ func runSandbox(args []string) int {
 		if key != "" {
 			if os.Getenv(key) != "" {
 				passNames = append(passNames, key)
-				fmt.Fprintln(os.Stderr, "sandboxcheckr: passing", key, "to", commandName)
+				say("sandboxcheckr: passing %s to %s", key, commandName)
 			} else if home, err := os.UserHomeDir(); err == nil {
 				for _, name := range files {
 					path := filepath.Join(home, name)
@@ -428,7 +431,7 @@ func runSandbox(args []string) int {
 							return 2
 						}
 						rwPaths = append(rwPaths, path)
-						fmt.Fprintln(os.Stderr, "sandboxcheckr: granting", commandName, "login file", path)
+						say("sandboxcheckr: granting %s login file %s", commandName, path)
 					}
 				}
 			}
@@ -529,11 +532,8 @@ func runSandbox(args []string) int {
 	stopOrphanedProxy(private)
 	if o.explain {
 		// Last, so it follows the proxy's own table: destinations first, then
-		// the refusals the proxy could never have seen. Colour follows the same
-		// rule as the rest of the tool, decided on stderr because that is where
-		// the summary goes.
-		st := emit.Palette(colorEnabled(*noColor, tty.IsTerminal(os.Stderr), os.Getenv("TERM")))
-		printRunExplain(os.Stderr, commandName, started, time.Now(), st)
+		// the refusals the proxy could never have seen.
+		printRunExplain(os.Stderr, commandName, started, time.Now(), summaryStyle())
 	}
 	if err == nil {
 		return 0
@@ -808,7 +808,7 @@ func eventLogForRun(explicit, project string) (string, error) {
 		if err == nil {
 			_ = f.Close()
 			if i > 0 {
-				fmt.Fprintln(os.Stderr, "sandboxcheckr: event log in", p)
+				say("sandboxcheckr: event log in %s", p)
 			}
 			return p, nil
 		}
@@ -818,6 +818,6 @@ func eventLogForRun(explicit, project string) (string, error) {
 		return "", fmt.Errorf("cannot create a private event log: %w", err)
 	}
 	p := filepath.Join(dir, "events.jsonl")
-	fmt.Fprintln(os.Stderr, "sandboxcheckr: event log in private temporary directory", p)
+	say("sandboxcheckr: event log in private temporary directory %s", p)
 	return p, nil
 }

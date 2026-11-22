@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
 )
@@ -453,6 +454,44 @@ func writeTrust(w io.Writer, c colors, sc model.Confinement) {
 func rule(w io.Writer, c colors, title string) {
 	bar := strings.Repeat(ruleRune, max(0, width-len(title)-4))
 	fmt.Fprintf(w, "%s%s%s %s%s%s %s%s\n\n", c.dim, ruleRune+ruleRune, c.reset, c.bold, title, c.reset, c.dim+bar, c.reset)
+}
+
+// ApplyGlyphs chooses the Unicode or ASCII glyph set for text this package
+// renders outside a report, such as a run's exit summary. The report sets it
+// from its own options; the summary has to draw the same rules, so it calls
+// this with the same facts about the environment.
+func ApplyGlyphs(ascii bool) { applyGlyphs(ascii) }
+
+// Section renders the header every summary in the tool uses: a dim rule, a
+// bold title, an optional dim note, and a filler rule. It returns a string so
+// the run's exit summary and the report agree on what a section looks like.
+// Colour is optional through st; the filler is measured on the plain text, so
+// escape sequences cannot change the width.
+func Section(st Styles, columns int, title, note string) string {
+	return SectionNote(st, st.Dim, columns, title, note)
+}
+
+// SectionNote is Section with the note in its own colour, for headers where the
+// note carries the verdict: a green "nothing used" against a red "2 trips".
+// noteStyle is one of Styles' escape strings, not a full palette.
+func SectionNote(st Styles, noteStyle string, columns int, title, note string) string {
+	if columns < 40 {
+		columns = 74
+	}
+	upper := strings.ToUpper(title)
+	// The filler is measured in columns on the plain line, not bytes: ─ is three
+	// bytes, and counting it as three columns pulls every header four short.
+	plain := ruleRune + ruleRune + " " + upper
+	if note != "" {
+		plain += "  " + note
+	}
+	plain += "  "
+	bar := strings.Repeat(ruleRune, max(2, columns-utf8.RuneCountInString(plain)))
+	line := st.Dim + ruleRune + ruleRune + st.Reset + " " + st.Bold + upper + st.Reset
+	if note != "" {
+		line += noteStyle + "  " + note + st.Reset
+	}
+	return line + st.Dim + "  " + bar + st.Reset + "\n"
 }
 
 // writeVerdict is the answer, placed where the answer belongs.

@@ -666,9 +666,6 @@ if [ "${CANARY_KILL:-0}" = 1 ] && [ -n "$CANARY_DIR" ]; then
 else
   run_confined "$@" || status=$?
 fi
-# Separate the program's own output from what the egress proxy observed, so
-# the summary that follows reads as the observed side of the run.
-echo >&2 "── observed connection attempts (this run's egress proxy) ──"
 kill "$PROXY_PID" 2>/dev/null || true
 proxy_status=0
 wait "$PROXY_PID" 2>/dev/null || proxy_status=$?

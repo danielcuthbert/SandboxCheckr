@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
 )
@@ -438,6 +439,22 @@ func TestMatrixExplainsColumnsAndUsage(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("matrix missing %q", want)
+		}
+	}
+}
+
+// A section header is read as a rule the table under it sits inside, so it has
+// to land on the column width exactly. The filler used to be measured in bytes,
+// which counted each ─ as three columns and pulled every header four short.
+func TestSectionIsExactlyTheColumnWidth(t *testing.T) {
+	t.Cleanup(func() { applyGlyphs(false) })
+	for _, note := range []string{"", "2 hosts, 3 refused", "run 13610e6f, 1 trip — café"} {
+		got := strings.TrimSuffix(Section(Styles{}, 74, "destinations", note), "\n")
+		if n := utf8.RuneCountInString(got); n != 74 {
+			t.Errorf("note %q: header is %d columns wide, want 74:\n%s", note, n, got)
+		}
+		if !strings.HasPrefix(got, "── DESTINATIONS") {
+			t.Errorf("note %q: header does not start with the rule and title: %q", note, got)
 		}
 	}
 }

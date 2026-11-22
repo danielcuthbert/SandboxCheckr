@@ -34,7 +34,8 @@ func stopOrphanedProxy(private string) {
 	if !aliveProxy(pid) {
 		return
 	}
-	fmt.Fprintln(os.Stderr, "── observed connection attempts ──")
+	fmt.Fprint(os.Stderr, "\n")
+	section(os.Stderr, summaryStyle(), "egress", "a proxy left by an earlier run is being stopped")
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return

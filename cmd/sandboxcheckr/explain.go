@@ -246,9 +246,8 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 	dim, yellow, green := st.Dim, st.Yellow, st.Green
 	var b strings.Builder
 	b.WriteString("\n")
-	head := "── refused by the sandbox (kernel log, " + procName + ", " +
-		since.Local().Format(stamp) + " to " + until.Local().Format(stamp) + ") ──"
-	b.WriteString(dim + head + st.Reset + "\n")
+	b.WriteString(emit.SectionNote(st, st.Dim, runColumns(), "sandbox refusals",
+		procName+", kernel log, "+since.Local().Format(stamp)+" to "+until.Local().Format(stamp)))
 	if len(ds) == 0 {
 		b.WriteString(green + "  nothing was refused for " + procName + " in this window." + st.Reset + "\n")
 		b.WriteString(dim + "  So the failure is not the sandbox: look at what the program printed." + st.Reset + "\n")
@@ -332,6 +331,11 @@ func summariseReasons(reasons []string) string {
 	}
 	distinct := unique(reasons)
 	sort.SliceStable(distinct, func(i, j int) bool { return counts[distinct[i]] > counts[distinct[j]] })
+	// One reason is already counted by the phrase this sits in ("15 routine
+	// refusals hidden:"), so repeating the number reads as a typo.
+	if len(distinct) == 1 {
+		return distinct[0]
+	}
 	parts := make([]string, 0, len(distinct))
 	for _, r := range distinct {
 		parts = append(parts, fmt.Sprintf("%d %s", counts[r], r))

@@ -86,7 +86,8 @@ func TestFormatDenials(t *testing.T) {
 	noise := []string{"the VoiceOver check most programs ignore", "the VoiceOver check most programs ignore"}
 	out := formatDenials(ds, noise, "codex", since, until, emit.Styles{})
 	for _, want := range []string{
-		"refused by the sandbox (kernel log, codex,",
+		"SANDBOX REFUSALS",
+		"kernel log", "codex,",
 		"20:20:00 to 20:21:30",
 		"count", "operation", "target", "notes",
 		"file-ioctl", "/dev/ttys003",

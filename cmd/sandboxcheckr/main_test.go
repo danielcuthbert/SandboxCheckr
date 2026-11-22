@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
 	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
 )
@@ -188,7 +189,7 @@ func TestDenyAllSuppressesDefaultAllow(t *testing.T) {
 func TestObserveSummaryOmitsMalformedHosts(t *testing.T) {
 	var buf strings.Builder
 	list, _ := proxy.NewAllowList(nil)
-	printSummary(&buf, []proxy.Stat{
+	printSummary(&buf, emit.Styles{}, []proxy.Stat{
 		{Host: "api.anthropic.com", Port: "443"},
 		{Host: "$(touch /tmp/pwned).evil.com", Port: "443"},
 		{Host: "evil.com", Port: "443;id"},
