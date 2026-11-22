@@ -579,20 +579,29 @@ enforcing proxy for the run and checks the sandbox can reach it, so its score
 reflects the profile *and* the proxy together.
 
 **Canary credentials.** Each `run` invocation or emitted `*-proxy` runner
-creates a fresh canary set for that agent run. It plants fake cloud,
-Kubernetes, registry, database and API
-credentials in environment variables and private tool config files. The fake
-service hosts end in `.invalid`, so they cannot resolve to real services. The
+creates a fresh canary set for that agent run. It plants fake cloud, Kubernetes,
+registry, database and API credentials in environment variables and private tool
+config files. The fake service hosts end in `.invalid`, so they cannot resolve to
+real services. The
 proxy refuses a connection to one of these hosts even in observe mode and
 refuses a request carrying a canary token where it can read the request (plain
 HTTP or a `--rule` host). It writes `CANARY TRIPPED` to the proxy log, puts a
 CANARY section first in the exit summary, records the trip under `AGENT=` in
-the event log, and makes the runner exit non-zero. Use `sandboxcheckr console
-canaries` to see trips across agents.
+the event log, and makes the runner exit 3 whatever the program's own status
+was. Use `sandboxcheckr console canaries` to see trips across agents.
 
 Trips to a canary's own host are **medium** confidence; sending its token to
-another host is **high** confidence. With `run`, `--canary-kill` stops the
-command on a high-confidence trip and `--no-canary` disables planting. Emitted
+another host is **high** confidence. Neither one stops the program by itself: the
+request that carried the token is refused, or forwarded when it is an external
+token whose alert needs the trip, and the agent carries on, with the run failing
+only at the end, on exit code 3 whatever the program claimed about its own
+status. `--canary-kill` is what stops it. On the first **high**-confidence trip
+the proxy kills the sandboxed process with SIGKILL, so the program gets no
+cleanup of its own and the runner sweeps the planted files; a **medium** trip
+never kills. Forwarding is not an exemption, which is the part that surprises
+people: a token whose traffic we deliberately let through so the vendor's alert
+fires still ends the run under `--canary-kill`. `--no-canary` switches planting
+off altogether. Emitted
 runners use `CANARY_KILL=1` and `CANARY=0` for those choices. A group is skipped
 if `--pass-env` supplies its real credential or `--ro` / `--rw` exposes its
 config directory (`PASS_ENV`, `EXTRA_RO`, `EXTRA_RW` in emitted runners).
@@ -601,30 +610,47 @@ bubblewrap exposes them read-only
 and substitutes a canary for existing project `.env` files. Seatbelt keeps its
 `.env` access denial and cannot substitute file content.
 
-**External canary tokens.** You can also pass tokens from an outside token
-service (a DNS token from canarytokens.org, for example) with `--canary-token`:
-a hostname, or `name=value` to watch a string; repeatable, or the project
-file's `canary-token` key. Nothing about
-these is planted in the sandbox: a hostname's whole value is that a lookup of
-it reaches the token service's own nameserver and alerts you there; a value
-token's whole value is the string itself. The relay
-therefore forwards a lookup of such a host and answers it normally, while
-recording a **high**-confidence trip: the token service emails you, and the
-exit summary and event log both show the trip, so `--canary-kill` stops the
-command on it. A connection to the token host itself is the token's intended
-use, so it is forwarded too: the token service sees the protocol exchange its
-alert waits for, and the trip is still recorded at high confidence. What is
-refused is the token showing up somewhere else: the name appearing in a
-request line or body aimed at another host trips at high confidence and is
-blocked, as it is for a planted canary. `--no-canary` disables external
-tokens along with the planted ones, and the deny file cuts a token off mid-run
-like any other host.
+This is what a trip leaves behind. A program that sent a planted API key in a
+plain HTTP body, in a run with nothing allow-listed:
 
-To use one: create the token on canarytokens.org (a DNS token from
-https://canarytokens.org/nest/create/dns, or any kind that hands you a
-hostname, such as https://canarytokens.org/nest/create/sql-server), give it a
-memo you will recognise (`agent on sparky`, say), and paste the hostname it
-shows you into the run:
+```
+-- CANARY  run 37dbc27a740d138e281f1dd4, 1 trip  -------------------------
+  HIGH  generic-api  POST example.com:80  — see CANARY TRIPPED in the proxy log
+
+-- DESTINATIONS  2 hosts, 2 refused  -------------------------------------
+  host:port       conns denied       sent   received  notes
+  example.com:80      1      1        0 B        0 B  CANARY TRIPPED ×1; POST×1
+```
+
+The request that carried the key was refused, the program printed what it had to
+print next and ran to completion, and the run exited 3 at the end. The trip is
+named at the top of the summary rather than buried in the table, because the
+table is where you go to find what the program wanted and the CANARY section is
+where you go to find out you were had.
+
+**External canary tokens.** You can also pass tokens from an outside token
+service (a DNS token from canarytokens.org, for example) with
+`--canary-token`: a hostname, or `name=value` to watch a string; repeatable, or
+the project file's `canary-token` key. Nothing about these is planted in the
+sandbox: a hostname's whole value is that a lookup of it reaches the token
+service's own nameserver and alerts you there; a value token's whole value is
+the string itself. The relay therefore forwards a lookup of such a host and
+answers it normally, while recording a **high**-confidence trip: the token
+service emails you, and the exit summary and event log both show the trip, so
+`--canary-kill` stops the command on it. A connection to the token host itself
+is the token's intended use, so it is forwarded too: the token service sees the
+protocol exchange its alert waits for, and the trip is still recorded at high
+confidence. What is refused is the token showing up somewhere else: the name
+appearing in a request line or body aimed at another host trips at high
+confidence and is blocked, as it is for a planted canary. `--no-canary`
+disables external tokens along with the planted ones, and the deny file cuts a
+token off mid-run like any other host.
+
+To use one: create the token at https://canarytokens.org/generate, which lists
+the kinds. `DNS` is the one to reach for, because its alert is the lookup
+itself: no connection has to succeed, which is exactly the shape of an agent
+that resolved a name out of a prompt. Give it a memo you will recognise
+(`agent on sparky`, say), and paste the hostname it shows you into the run:
 
 ```sh
 sandboxcheckr run --canary-token abc123xyz.canarytokens.com -- claude
@@ -643,6 +669,14 @@ emails you within seconds and the run's exit summary shows a CANARY section
 naming the token. The hostname is the same in every run that carries it, so
 the email tells you the token tripped, not which run tripped it: create one
 token per project, or one per agent, if you want to tell them apart. A DNS
+token can also carry the label itself: base32 the string you want back, drop
+the `=` padding, split it every 63 characters, and put `.G` plus two digits and
+a dot in front of the token, so
+`JEQGC3JAMEQ….MEBTWY5LHFY.G72.abc123xyz.canarytokens.com` is one hostname that
+names the project and the agent when it alerts; Thinkst decodes it into the
+incident it sends ([the rules](https://docs.canarytokens.org/guide/dns-token)).
+The hostname still has to fit 253 bytes, which leaves about 125 bytes of text,
+enough for a project name and an agent label and nothing grander. A DNS
 token (and a log4shell token) alerts on the lookup itself, so a pasted
 hostname gets you the Thinkst email as well as the trip. Kinds whose alert
 needs their protocol to reach the token service (a SQL Server, MySQL,
@@ -667,7 +701,10 @@ metacharacters are refused at the flag, because the value travels through the
 runner's shell and a token that split into words would arrive as arguments to
 the token command instead. Paste a card number without spaces (dashes are
 removed for you, so `4111-1111-1111-1111` is fine), and what remains must be
-plain token characters.
+plain token characters. A web bug token is the awkward one, because it hands you
+a URL rather than either half: pass the hostname on its own so a lookup or a
+connection trips it, and the token's path as a `name=value` token as well, so the
+same token quoted in a request aimed at some other host trips too.
 
 The `canary.detection` probe verifies that a confined child can trigger a
 recorded proxy trip. No trip during an agent run does not mean it was clean:

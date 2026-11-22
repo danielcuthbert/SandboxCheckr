@@ -36,8 +36,10 @@ proxy too, under the same allow-list. It also plants fake credentials whose
 attempted use it can detect, and can carry a token from an outside token
 service such as canarytokens.org: a hostname whose lookups and connections
 are forwarded so the token service can alert you, or a `name=value` string
-whose visible use is denied. A canary trip is blocked and makes the command
-exit nonzero.
+whose visible use is denied. A trip is refused and the run ends on exit code 3,
+whatever the program claimed about its own status; without `--canary-kill` the
+program carries on until it finishes, and with it a high-confidence trip kills
+the process where it stands.
 
 To see which hosts a command needs, then allow only the ones you choose:
 
