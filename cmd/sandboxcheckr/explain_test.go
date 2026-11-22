@@ -1,14 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
+	"github.com/danielcuthbert/sandboxcheckr/internal/events"
 )
 
 // Lines as sandboxd writes them to the unified log, taken from a real codex run
@@ -27,32 +32,46 @@ const (
 
 func TestParseDenialLine(t *testing.T) {
 	cases := []struct {
-		name, line, wantOp, wantTarget string
-		ok                             bool
+		name, line, wantProc, wantOp, wantTarget string
+		ok                                       bool
 	}{
-		{"preference", logPref, "user-preference-read", "com.apple.universalaccess", true},
-		{"ioctl", logIoctl, "file-ioctl", "/dev/ttys003", true},
-		{"resolver socket", logSock, "network-outbound", "/private/var/run/mDNSResponder", true},
-		{"write", logWrite, "file-write-create", "/Users/daniel/.cache/codex-runtimes/codex-primary-runtime/dependencies/docs/anything.txt", true},
-		{"agent socket", logSocket, "network-outbound", "/Users/daniel/.codex/app-server-control/app-server-control.sock", true},
-		{"not a refusal", logAllow, "", "", false},
-		{"other process", logOther, "", "", false},
-		{"longer name is another process", logLonger, "", "", false},
-		{"no denial here", logNoise, "", "", false},
-		{"empty", "", "", "", false},
+		{"preference", logPref, "codex", "user-preference-read", "com.apple.universalaccess", true},
+		{"ioctl", logIoctl, "codex", "file-ioctl", "/dev/ttys003", true},
+		{"resolver socket", logSock, "codex", "network-outbound", "/private/var/run/mDNSResponder", true},
+		{"write", logWrite, "codex", "file-write-create", "/Users/daniel/.cache/codex-runtimes/codex-primary-runtime/dependencies/docs/anything.txt", true},
+		{"agent socket", logSocket, "codex", "network-outbound", "/Users/daniel/.codex/app-server-control/app-server-control.sock", true},
+		{"not a refusal", logAllow, "", "", "", false},
+		// A helper is a refusal the sandbox made, so it parses; which table it
+		// lands in is aggregateDenials' business.
+		{"other process", logOther, "node", "file-write-create", "/Users/daniel/x", true},
+		{"longer name is another process", logLonger, "codex-helper", "file-write-create", "/Users/daniel/x", true},
+		{"no denial here", logNoise, "", "", "", false},
+		{"empty", "", "", "", "", false},
 	}
 	for _, c := range cases {
-		op, target, ok := parseDenialLine(c.line, "codex")
-		if ok != c.ok || op != c.wantOp || target != c.wantTarget {
-			t.Errorf("%s: got (%q, %q, %v), want (%q, %q, %v)", c.name, op, target, ok, c.wantOp, c.wantTarget, c.ok)
+		proc, op, target, ok := parseDenialLine(c.line)
+		if ok != c.ok || proc != c.wantProc || op != c.wantOp || target != c.wantTarget {
+			t.Errorf("%s: got (%q, %q, %q, %v), want (%q, %q, %q, %v)",
+				c.name, proc, op, target, ok, c.wantProc, c.wantOp, c.wantTarget, c.ok)
 		}
 	}
 }
 
+// explainFor is the report request a test needs: a named program in a window and
+// nothing else, so what it asserts is about the refusals. The event log is left
+// unset, which reads as a run that contacted nothing.
+func explainFor(command string) explainRequest {
+	now := time.Now()
+	return explainRequest{command: command, argv: []string{command}, since: now.Add(-time.Minute), until: now}
+}
+
 func TestParseDenialLineRejectsUnsafeNames(t *testing.T) {
-	// The name goes into a quoted log predicate.
-	for _, name := range []string{`co"dex`, "codex (1)", "", "codex) deny(1", strings.Repeat("x", 65)} {
-		if _, _, ok := parseDenialLine(logIoctl, name); ok {
+	// A logged name has to look like an executable name before anything is
+	// printed with it, and a name with a quote or a paren in it would be the
+	// kernel log saying something it did not.
+	for _, name := range []string{`co"dex`, "codex (1)", "codex) deny(1", strings.Repeat("x", 65)} {
+		line := `2026-11-22 20:20:32.708356+0000 sandboxd: Sandbox: ` + name + `(21003) deny(1) file-read-data /etc/hosts`
+		if _, _, _, ok := parseDenialLine(line); ok {
 			t.Errorf("parseDenialLine accepted the process name %q", name)
 		}
 	}
@@ -60,9 +79,12 @@ func TestParseDenialLineRejectsUnsafeNames(t *testing.T) {
 
 func TestAggregateDenialsCountsAndOrders(t *testing.T) {
 	lines := []string{logWrite, logIoctl, logIoctl, logIoctl, logSock, logPref, logNoise, logAllow}
-	shown, hidden := aggregateDenials(lines, "codex")
+	shown, hidden, others := aggregateDenials(lines, "codex")
 	if len(hidden) != 1 {
 		t.Fatalf("hidden = %v, want one VoiceOver preference read", hidden)
+	}
+	if len(others) != 0 {
+		t.Errorf("nothing here was refused to another process: %+v", others)
 	}
 	if len(shown) != 3 {
 		t.Fatalf("got %d distinct refusals, want 3: %+v", len(shown), shown)
@@ -72,6 +94,84 @@ func TestAggregateDenialsCountsAndOrders(t *testing.T) {
 	}
 	if shown[1].op != "file-write-create" || shown[2].op != "network-outbound" {
 		t.Errorf("tie broken wrong: %s before %s", shown[1].op, shown[2].op)
+	}
+}
+
+// compactLine writes one line as sandboxd does, so a test can name the process
+// the kernel blamed.
+func compactLine(proc string, pid int, op, target string) string {
+	return `2026-11-22 09:21:43.2291+0000 0x1d383a   Default     0x0                  485    0    ` +
+		`sandboxd: [com.apple.sandbox.reporting:violation] Sandbox: ` +
+		fmt.Sprintf("%s(%d) deny(1) %s %s", proc, pid, op, target)
+}
+
+// A shell script is logged as bash and its helpers under their own names, so the
+// refusals that stopped a program never carry the name the user typed. raptor on
+// 2026-11-22: its clear died in dyld because the sandbox blocked the open of
+// /opt/local/lib/libncurses.6.dylib, and --explain said nothing had been refused.
+func TestPrintRunExplainShowsTheConfinedTree(t *testing.T) {
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{
+			compactLine("clear", 29159, "file-read-data", "/opt/local/lib/libncurses.6.dylib"),
+			compactLine("bash", 29062, "file-write-create", "/tmp/claude-501"),
+			compactLine("node", 29180, "file-write-create", "/Users/daniel/.local/share/raptor/sessions.d"),
+		}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, explainFor("raptor"), emit.Styles{})
+	out := b.String()
+	for _, want := range []string{
+		"SANDBOX REFUSALS", "kernel log, all confined",
+		"process", "clear", "/opt/local/lib/libncurses.6.dylib", "bash", "/tmp/claude-501", "node",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the tree report lacks %q:\n%s", want, out)
+		}
+	}
+	// The innocent verdict is the sentence that must never appear here: the
+	// sandbox is exactly what stopped this program.
+	for _, bad := range []string{"So the failure is not the sandbox", "nothing was refused for raptor"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the report clears the sandbox while a confined process was refused: %q\n%s", bad, out)
+		}
+	}
+}
+
+// When the named program was itself refused things, that is the report; the
+// neighbours in the same window do not crowd out the answer.
+func TestPrintRunExplainPrefersTheNamedProgram(t *testing.T) {
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{logIoctl, compactLine("someother", 42, "file-read-data", "/etc/hosts")}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, explainFor("codex"), emit.Styles{})
+	out := b.String()
+	if !strings.Contains(out, "file-ioctl") || !strings.Contains(out, "codex, kernel log") {
+		t.Errorf("the program's own refusals should lead:\n%s", out)
+	}
+	if strings.Contains(out, "someother") {
+		t.Errorf("another process crowded into the program's own table:\n%s", out)
+	}
+}
+
+// Nothing at all was refused, by anyone: only then does the report vouch for the
+// sandbox.
+func TestPrintRunExplainClearsTheSandboxOnlyWhenEmpty(t *testing.T) {
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{logAllow, logNoise}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, explainFor("codex"), emit.Styles{})
+	out := b.String()
+	if !strings.Contains(out, "nothing was refused for codex") ||
+		!strings.Contains(out, "No other confined process was refused either") {
+		t.Errorf("a genuinely empty window should read as clean:\n%s", out)
 	}
 }
 
@@ -275,11 +375,11 @@ func TestRoutineDenialsCoverOnlyWhatWasMeasured(t *testing.T) {
 func TestPrintRunExplainRendersTheQuery(t *testing.T) {
 	old := queryKernelLog
 	defer func() { queryKernelLog = old }()
-	queryKernelLog = func(string, time.Time, time.Time) ([]string, error) {
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
 		return []string{logIoctl, logIoctl, logSocket, logPref, logPref}, nil
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
+	printRunExplain(&b, explainFor("codex"), emit.Styles{})
 	out := b.String()
 	for _, want := range []string{"file-ioctl", "/dev/ttys003", "app-server-control.sock", "routine refusals hidden"} {
 		if !strings.Contains(out, want) {
@@ -291,11 +391,11 @@ func TestPrintRunExplainRendersTheQuery(t *testing.T) {
 func TestPrintRunExplainWithoutAKernelLog(t *testing.T) {
 	old := queryKernelLog
 	defer func() { queryKernelLog = old }()
-	queryKernelLog = func(string, time.Time, time.Time) ([]string, error) {
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
 		return nil, errExplainUnsupported
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
+	printRunExplain(&b, explainFor("codex"), emit.Styles{})
 	out := b.String()
 	if !strings.Contains(out, "macOS kernel log") || !strings.Contains(out, "EPERM") {
 		t.Errorf("Linux should say it cannot do this rather than print an empty table:\n%s", out)
@@ -306,20 +406,41 @@ func TestPrintRunExplainWithoutAKernelLog(t *testing.T) {
 }
 
 func TestPrintRunExplainColourClosesEveryLine(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
 	old := queryKernelLog
 	defer func() { queryKernelLog = old }()
-	queryKernelLog = func(string, time.Time, time.Time) ([]string, error) {
-		return nil, errExplainUnsupported
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{
+			compactLine("codex", 21003, "file-read-data", filepath.Join(root, "lib", "libncurses.6.dylib")),
+			compactLine("codex", 21003, "file-write-create", filepath.Join(root, "home", ".local", "share", "raptor")),
+			compactLine("codex", 21003, "file-ioctl", "/dev/ttys003"),
+		}, nil
+	}
+	newReq := func() explainRequest {
+		req := explainFor("codex")
+		req.agent = "codex-1"
+		req.workdir = workOf(root)
+		req.argv = []string{"codex", "--ask", "one two"}
+		req.baseFlags = []string{"--deny-all"}
+		req.eventsPath = writeEventsFixture(t, req.agent,
+			events.Event{Time: time.Now(), Kind: events.KindConnect, Decision: events.Deny, Host: "api.example.com", Reason: "not in allow-list"})
+		return req
 	}
 	on := emit.Palette(true)
 	var plain, coloured strings.Builder
-	printRunExplain(&plain, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
-	printRunExplain(&coloured, "codex", time.Now().Add(-time.Minute), time.Now(), on)
+	printRunExplain(&plain, newReq(), emit.Styles{})
+	printRunExplain(&coloured, newReq(), on)
 	if got := ansiSequences.ReplaceAllString(coloured.String(), ""); got != plain.String() {
-		t.Errorf("colour changed the note.\nplain:\n%s\ncoloured, stripped:\n%s", plain.String(), got)
+		t.Errorf("colour changed the report.\nplain:\n%s\ncoloured, stripped:\n%s", plain.String(), got)
+	}
+	if !strings.Contains(plain.String(), "NEXT RUN") {
+		t.Fatalf("the fixture should reach the end of the report:\n%s", plain.String())
 	}
 	for _, line := range strings.Split(coloured.String(), "\n") {
-		if strings.TrimSpace(line) != "" && !strings.Contains(line, on.Reset) {
+		// A row the palette says nothing about carries no escape at all; a row
+		// that carries one has to close it, or the shell inherits the colour.
+		if strings.Contains(line, "\x1b") && !strings.Contains(line, on.Reset) {
 			t.Errorf("an unclosed escape leaks colour into the shell: %q", line)
 		}
 	}
@@ -328,11 +449,11 @@ func TestPrintRunExplainColourClosesEveryLine(t *testing.T) {
 func TestPrintRunExplainQueryFailure(t *testing.T) {
 	old := queryKernelLog
 	defer func() { queryKernelLog = old }()
-	queryKernelLog = func(string, time.Time, time.Time) ([]string, error) {
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
 		return nil, errors.New("the log query timed out; try a shorter run")
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
+	printRunExplain(&b, explainFor("codex"), emit.Styles{})
 	if out := b.String(); !strings.Contains(out, "could not read the kernel log") {
 		t.Errorf("a failed query should be reported, not swallowed:\n%s", out)
 	}
@@ -374,8 +495,321 @@ func TestFormatDenialsColourKeepsTheColumns(t *testing.T) {
 
 func TestPrintRunExplainRejectsAwkwardCommand(t *testing.T) {
 	var b strings.Builder
-	printRunExplain(&b, `co"dex`, time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
+	printRunExplain(&b, explainFor(`co"dex`), emit.Styles{})
 	if !strings.Contains(b.String(), "cannot search the kernel log") {
 		t.Error("an unsafe command name should be refused before the query")
+	}
+}
+
+// The report's job is to end with the command to run next, so the plan behind it
+// is where the tool's opinion lives: which paths a refusal turns into a grant,
+// and which it refuses to turn into one.
+
+// outsideTemp points the private-scratch rule at a directory no fixture is in.
+// The sandbox keeps /tmp to itself, and a test fixture built with t.TempDir
+// would otherwise be counted as scratch rather than as a path to grant.
+func outsideTemp(t *testing.T) {
+	t.Helper()
+	old := privateTempDirs
+	privateTempDirs = []string{filepath.Join(string(filepath.Separator), "sandboxcheckr-test-tmp")}
+	t.Cleanup(func() { privateTempDirs = old })
+}
+
+// fixtureTree makes the shapes a refusal can name: a directory, a file inside it,
+// a directory the program was trying to create, and a workdir of its own.
+func fixtureTree(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, dir := range []string{"lib", "work", "home", "home/.local"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{"lib/libncurses.6.dylib", "home/.CFUserTextEncoding", "work/main.go"} {
+		if err := os.WriteFile(filepath.Join(root, file), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// workOf is the fixture's project directory: a refusal inside it is the profile
+// protecting its own files, which is a different answer from a missing grant.
+func workOf(root string) string { return filepath.Join(root, "work") }
+
+func read(target string) denial {
+	return denial{proc: "prog", op: "file-read-data", target: target, count: 1}
+}
+
+func write(target string) denial {
+	return denial{proc: "prog", op: "file-write-create", target: target, count: 1}
+}
+
+// writeEventsFixture writes the lines the proxy would have appended for this
+// run. An event with no agent is stamped with the run's label, because it is the
+// run's own lines the plan is allowed to read: two agents' runs share one log.
+func writeEventsFixture(t *testing.T, agent string, evs ...events.Event) string {
+	t.Helper()
+	var b strings.Builder
+	for _, e := range evs {
+		if e.Agent == "" {
+			e.Agent = agent
+		}
+		raw, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestPlanGrantsNarrowsAFileToItsDirectory(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	p := planGrants([]denial{read(filepath.Join(root, "lib", "libncurses.6.dylib"))}, workOf(root))
+	if len(p.ro) != 1 || p.ro[0] != filepath.Join(root, "lib") {
+		t.Fatalf("ro = %v, want the containing directory %s", p.ro, filepath.Join(root, "lib"))
+	}
+	if len(p.rw) != 0 || p.notGrantable != 0 {
+		t.Errorf("a read refusal must not produce a write grant or a count: %v %d", p.rw, p.notGrantable)
+	}
+}
+
+func TestPlanGrantsFallsBackToTheFileWhenTheDirectoryIsTooBroad(t *testing.T) {
+	outsideTemp(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory to be too broad")
+	}
+	// The home directory is never a grant, so a dotfile refused there can only
+	// be granted as itself: the alternative is handing the program the home.
+	p := planGrants([]denial{read(filepath.Join(home, ".CFUserTextEncoding"))}, "")
+	if len(p.ro) != 1 || p.ro[0] != filepath.Join(home, ".CFUserTextEncoding") {
+		t.Fatalf("ro = %v, want the file itself", p.ro)
+	}
+}
+
+func TestPlanGrantsNamesTheDirectoryToCreate(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	missing := filepath.Join(root, "home", ".local", "share", "raptor", "sessions.d")
+	p := planGrants([]denial{write(missing)}, "")
+	want := filepath.Join(root, "home", ".local")
+	if len(p.rw) != 1 || p.rw[0] != want {
+		t.Fatalf("rw = %v, want the nearest directory that exists, %s", p.rw, want)
+	}
+	// The grant has to be a path run will accept, so the mkdir names what the
+	// program was trying to make and --rw alone could not reach.
+	if want := []string{filepath.Dir(missing)}; !slices.Equal(p.mkdir, want) {
+		t.Errorf("mkdir = %v, want %v so --rw will accept it", p.mkdir, want)
+	}
+}
+
+func TestPlanGrantsCountsWhatNoFlagCanOpen(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	p := planGrants([]denial{
+		{proc: "prog", op: "file-ioctl", target: "/dev/ttys003", count: 1},
+		{proc: "prog", op: "network-outbound", target: "/private/var/run/mDNSResponder", count: 1},
+		{proc: "prog", op: "network-bind", target: "local:*:0", count: 1},
+		{proc: "prog", op: "mach-lookup", target: "com.apple.coreservices.launchservicesd", count: 1},
+		read(filepath.Join(root, "work", "main.go")),
+		write(filepath.Join(root, "work", "out", "x")),
+		read(filepath.Join(root, "lib", "a b.dylib")),
+	}, workOf(root))
+	if p.notGrantable != 5 {
+		t.Errorf("notGrantable = %d, want 5: ioctl, socket, listener, mach, and a path with a space", p.notGrantable)
+	}
+	if p.insideWorkdir != 2 {
+		t.Errorf("insideWorkdir = %d, want 2: the workdir protects its own files, it is not a missing grant", p.insideWorkdir)
+	}
+	if len(p.ro)+len(p.rw) != 0 {
+		t.Errorf("nothing here is a grant, got ro=%v rw=%v", p.ro, p.rw)
+	}
+}
+
+func TestPlanGrantsKeepsScratchOutOfThePlan(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	privateTempDirs = []string{filepath.Join(root, "scratch")}
+	if err := os.MkdirAll(filepath.Join(root, "scratch"), 0o1777); err != nil {
+		t.Fatal(err)
+	}
+	p := planGrants([]denial{write(filepath.Join(root, "scratch", "claude-501"))}, "")
+	if p.inTemp != 1 {
+		t.Errorf("inTemp = %d, want 1: the shared temp dir is a decision of its own", p.inTemp)
+	}
+	if len(p.rw) != 0 {
+		t.Errorf("rw = %v, want the scratch directory left out of the paste line", p.rw)
+	}
+}
+
+func TestPlanGrantsCapsTheLine(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	var ds []denial
+	for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
+		dir := filepath.Join(root, "lib", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		ds = append(ds, read(filepath.Join(dir, "libthing.dylib")))
+	}
+	p := planGrants(ds, workOf(root))
+	if len(p.ro) != maxPlanGrants {
+		t.Errorf("ro = %d entries, want the cap of %d", len(p.ro), maxPlanGrants)
+	}
+	if p.overCap != 1 {
+		t.Errorf("overCap = %d, want 1 said out loud rather than dropped", p.overCap)
+	}
+	if !slices.IsSorted(p.ro) {
+		t.Errorf("ro = %v, want a stable order whatever the kernel logged", p.ro)
+	}
+}
+
+func TestPlanAllowsReadsTheRunsOwnDestinations(t *testing.T) {
+	now := time.Now()
+	req := explainFor("prog")
+	req.agent = "prog-1"
+	req.eventsPath = writeEventsFixture(t, req.agent,
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "api.example.com", Port: "443", Reason: "not in allow-list"},
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Allow, Host: "cdn.example.com", Port: "8443"},
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "inference.internal", Port: "443",
+			Reason: "resolved to non-public address 10.0.0.5; refusing (use --allow-private-host inference.internal to permit this host only)"},
+		// None of these belong in a recommendation.
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "canary.example", Reason: "canary credential"},
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "is.gd", Relay: "shortener"},
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "127.0.0.1", Port: "8080"},
+		// A name looked up and never dialled is not something to open...
+		events.Event{Time: now, Kind: events.KindDns, Decision: events.Deny, Host: "looked-up-only.example", Port: "53"},
+		// ...and another agent's run in the same log is not this run's business.
+		events.Event{Time: now, Kind: events.KindConnect, Decision: events.Deny, Host: "another-agent.example", Agent: "someone-else"},
+	)
+	p := planAllows(req)
+	if strings.Join(p.allows, " ") != "api.example.com cdn.example.com inference.internal" {
+		t.Errorf("allows = %v", p.allows)
+	}
+	if strings.Join(p.ports, " ") != "8443" {
+		t.Errorf("ports = %v, want only the non-default one", p.ports)
+	}
+	if strings.Join(p.privHosts, " ") != "inference.internal" {
+		t.Errorf("privHosts = %v, want the host the proxy refused for being private", p.privHosts)
+	}
+	if p.refused != 3 {
+		t.Errorf("refused = %d, want the canary, the shortener and loopback counted separately", p.refused)
+	}
+}
+
+func TestFormatNextRunIsPasteable(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	req := explainFor("raptor")
+	req.argv = []string{"./bin/raptor", "--prompt", "say hi"}
+	req.baseFlags = []string{"--deny-all", "--ro", filepath.Join(root, "lib")}
+	g := planGrants([]denial{
+		read(filepath.Join(root, "lib", "libncurses.6.dylib")), // already granted: must not be repeated
+		read(filepath.Join(root, "home", ".CFUserTextEncoding")),
+		write(filepath.Join(root, "home", ".local", "share", "raptor", "sessions.d")),
+	}, workOf(root))
+	h := hostPlan{allows: []string{"api.example.com"}, ports: []string{"8443"}}
+	out := formatNextRun(g, h, req, emit.Styles{})
+	for _, want := range []string{
+		"sandboxcheckr run --explain --deny-all",
+		"--allow api.example.com",
+		"--allow-port 8443",
+		"--ro " + filepath.Join(root, "home"),
+		"--rw " + filepath.Join(root, "home", ".local"),
+		"'say hi'",
+		"./bin/raptor",
+		"mkdir -p " + filepath.Join(root, "home", ".local", "share", "raptor"),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the next-run line is missing %q:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "--ro "+filepath.Join(root, "lib")); n != 1 {
+		t.Errorf("a grant the run already had should appear once, from the flags it ran with, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "2 grants, 2 hosts") {
+		t.Errorf("the header should count what it is offering:\n%s", out)
+	}
+}
+
+func TestFormatNextRunSaysWhenNothingIsMissing(t *testing.T) {
+	out := formatNextRun(grantPlan{notGrantable: 3}, hostPlan{}, explainFor("prog"), emit.Styles{})
+	if !strings.Contains(out, "nothing to add") {
+		t.Errorf("a run whose refusals are all by design should not offer flags:\n%s", out)
+	}
+	if strings.Contains(out, "sandboxcheckr run") {
+		t.Errorf("no command line should be offered when nothing would change:\n%s", out)
+	}
+	if !strings.Contains(out, "3 refusals are refused by design") {
+		t.Errorf("the report should still account for every refusal:\n%s", out)
+	}
+}
+
+func TestPrintRunExplainStillNamesTheHostsItReachedFor(t *testing.T) {
+	// The destinations came from the proxy, not the kernel, so a platform whose
+	// sandbox logs nothing still gets the half of the answer it can be given.
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) { return nil, errExplainUnsupported }
+	req := explainFor("prog")
+	req.agent = "prog-1"
+	req.argv = []string{"./prog", "--verbose"}
+	req.eventsPath = writeEventsFixture(t, req.agent,
+		events.Event{Time: time.Now(), Kind: events.KindConnect, Decision: events.Deny, Host: "api.example.com", Reason: "not in allow-list"},
+		events.Event{Time: time.Now(), Kind: events.KindConnect, Decision: events.Deny, Host: "inference.internal", Port: "8080",
+			Reason: "resolved to non-public address 10.0.0.5; refusing (use --allow-private-host inference.internal to permit this host only)"})
+	var b strings.Builder
+	printRunExplain(&b, req, emit.Styles{})
+	out := b.String()
+	if !strings.Contains(out, "Linux sandbox has none") {
+		t.Errorf("the missing kernel log should still be said out loud:\n%s", out)
+	}
+	for _, want := range []string{"sandboxcheckr run --explain", "--allow api.example.com",
+		"--allow inference.internal", "--allow-port 8080", "--allow-private-host inference.internal", "./prog --verbose"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrintRunExplainEndsWithTheNextCommand(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{
+			compactLine("raptor", 29159, "file-read-data", filepath.Join(root, "lib", "libncurses.6.dylib")),
+			compactLine("raptor", 29159, "file-ioctl", "/dev/ttys003"),
+		}, nil
+	}
+	req := explainFor("raptor")
+	req.agent = "raptor-1"
+	req.workdir = workOf(root)
+	req.argv = []string{"./bin/raptor"}
+	req.eventsPath = writeEventsFixture(t, req.agent,
+		events.Event{Time: time.Now(), Kind: events.KindConnect, Decision: events.Deny, Host: "api.example.com", Reason: "not in allow-list"})
+	var b strings.Builder
+	printRunExplain(&b, req, emit.Styles{})
+	out := b.String()
+	for _, want := range []string{
+		"NEXT RUN", "sandboxcheckr run --explain",
+		"--ro " + filepath.Join(root, "lib"),
+		"--allow api.example.com",
+		"./bin/raptor",
+		"1 refusal is refused by design",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report must end with what to run next, missing %q:\n%s", want, out)
+		}
 	}
 }

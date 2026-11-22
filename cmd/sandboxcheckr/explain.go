@@ -4,13 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
+	"github.com/danielcuthbert/sandboxcheckr/internal/events"
+	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 )
 
 // The egress proxy sees destinations. It cannot see the refusals that stop a
@@ -32,8 +37,11 @@ var errExplainUnsupported = errors.New("unsupported")
 // predicate string, so anything but an ordinary executable name is refused.
 var safeProcessName = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
 
-// denial is one distinct refusal, counted over the run.
+// denial is one distinct refusal, counted over the run. proc is empty for the
+// program --explain was asked about and set for a refusal logged against another
+// process in the same window, which the sandbox confined just as hard.
 type denial struct {
+	proc   string
 	op     string
 	target string
 	count  int
@@ -54,54 +62,59 @@ var routineDenials = []struct {
 	{"user-preference-read", "com.apple.security", "a preference read about the keychain, not the keychain itself"},
 }
 
-// parseDenialLine turns one unified-log line into an operation and a target.
-// The lines are written by sandboxd, not by us, and look like:
+// parseDenialLine turns one unified-log line into a process, an operation and a
+// target. The lines are written by sandboxd, not by us, and look like:
 //
 //	Sandbox: codex(18451) deny(1) user-preference-read com.apple.universalaccess
 //	Sandbox: codex(18451) deny(1) file-ioctl path:/dev/ttys003 ioctl-command:(0x540d 'TIOCSETA' { length: 128 })
 //	Sandbox: codex(19463) deny(1) network-outbound /private/var/run/mDNSResponder
 //	Sandbox: codex(21071) deny(1) file-write-create deny file-mode-mask (path:file-write-create /Users/d/.cache/x.txt (mode:0100644))
 //
-// Anything else, including the allow counterpart and lines about other
-// processes, is rejected.
-func parseDenialLine(line, procName string) (op, target string, ok bool) {
+// Every process the sandbox confined writes lines in this shape, so the name is
+// kept rather than matched away: a shell script is logged as bash, and the helper
+// that actually asked for the blocked file is logged under its own name.
+// Anything else, including the allow counterpart, is rejected.
+func parseDenialLine(line string) (proc, op, target string, ok bool) {
 	i := strings.Index(line, "Sandbox: ")
-	if i < 0 || !safeProcessName.MatchString(procName) {
-		return "", "", false
+	if i < 0 {
+		return "", "", "", false
 	}
 	rest := strings.TrimSpace(line[i+len("Sandbox: "):])
 	open := strings.IndexByte(rest, '(')
-	// The name is followed by (pid); a longer name that merely starts with the
-	// command (codex vs codex-helper) is a different process.
-	if open <= 0 || rest[:open] != procName {
-		return "", "", false
+	// The name is followed by (pid).
+	if open <= 0 {
+		return "", "", "", false
+	}
+	proc = rest[:open]
+	if !safeProcessName.MatchString(proc) {
+		return "", "", "", false
 	}
 	end := strings.IndexByte(rest[open:], ')')
 	if end < 0 {
-		return "", "", false
+		return "", "", "", false
 	}
 	rest = strings.TrimSpace(rest[open+end+1:])
 	if !strings.HasPrefix(rest, "deny") {
-		return "", "", false
+		return "", "", "", false
 	}
 	rest = rest[len("deny"):]
 	if strings.HasPrefix(rest, "(") {
 		stop := strings.IndexByte(rest, ')')
 		if stop < 0 {
-			return "", "", false
+			return "", "", "", false
 		}
 		rest = strings.TrimSpace(rest[stop+1:])
 	}
 	fields := strings.SplitN(rest, " ", 2)
 	op = fields[0]
 	if op == "" {
-		return "", "", false
+		return "", "", "", false
 	}
 	target = ""
 	if len(fields) > 1 {
 		target = cleanDenialTarget(fields[1])
 	}
-	return op, target, true
+	return proc, op, target, true
 }
 
 // cleanDenialTarget pulls the interesting thing out of the text after the
@@ -137,13 +150,17 @@ func routineWhy(op, target string) string {
 }
 
 // aggregateDenials collapses parsed lines into distinct refusals, counted, most
-// refused first so the thing that stopped the program is at the top. The second
-// result is why each routine refusal was folded away, one entry per line.
-func aggregateDenials(lines []string, procName string) (shown []denial, hidden []string) {
+// refused first so the thing that stopped the program is at the top. Refusals
+// logged against the program itself come back first; those logged against any
+// other process the sandbox confined in the same window come back separately,
+// with the name that was logged, because a run is a tree and the kernel names the
+// process that asked. The middle result is why each routine refusal was folded
+// away, one entry per line.
+func aggregateDenials(lines []string, procName string) (own []denial, hidden []string, others []denial) {
 	counts := map[string]int{}
 	order := []string{}
 	for _, line := range lines {
-		op, target, ok := parseDenialLine(line, procName)
+		proc, op, target, ok := parseDenialLine(line)
 		if !ok {
 			continue
 		}
@@ -151,28 +168,41 @@ func aggregateDenials(lines []string, procName string) (shown []denial, hidden [
 			hidden = append(hidden, why)
 			continue
 		}
-		key := op + "\x00" + target
+		key := proc + "\x00" + op + "\x00" + target
 		if counts[key] == 0 {
 			order = append(order, key)
 		}
 		counts[key]++
 	}
 	for _, key := range order {
-		parts := strings.SplitN(key, "\x00", 2)
-		shown = append(shown, denial{op: parts[0], target: parts[1], count: counts[key]})
+		parts := strings.Split(key, "\x00")
+		d := denial{proc: parts[0], op: parts[1], target: parts[2], count: counts[key]}
+		if d.proc == procName {
+			d.proc = ""
+			own = append(own, d)
+		} else {
+			others = append(others, d)
+		}
 	}
-	sort.SliceStable(shown, func(i, j int) bool {
-		if shown[i].count != shown[j].count {
-			return shown[i].count > shown[j].count
+	byRank := func(ds []denial) func(i, j int) bool {
+		return func(i, j int) bool {
+			if ds[i].count != ds[j].count {
+				return ds[i].count > ds[j].count
+			}
+			if ds[i].proc != ds[j].proc {
+				return ds[i].proc < ds[j].proc
+			}
+			if ds[i].op != ds[j].op {
+				return ds[i].op < ds[j].op
+			}
+			// Same count, process and operation: order the targets so rows that
+			// differ only in path sit together and read as one block.
+			return ds[i].target < ds[j].target
 		}
-		if shown[i].op != shown[j].op {
-			return shown[i].op < shown[j].op
-		}
-		// Same count and operation: order the targets so rows that differ only
-		// in path sit together and read as one block.
-		return shown[i].target < shown[j].target
-	})
-	return shown, hidden
+	}
+	sort.SliceStable(own, byRank(own))
+	sort.SliceStable(others, byRank(others))
+	return own, hidden, others
 }
 
 // noteLevel says how a refusal should read: a grant you can add, something the
@@ -244,13 +274,31 @@ func padLeft(s string, width int) string {
 func formatDenials(ds []denial, hidden []string, procName string, since, until time.Time, st emit.Styles) string {
 	const stamp = "15:04:05"
 	dim, yellow, green := st.Dim, st.Yellow, st.Green
+	// A row carrying a process name means this table is not about the program
+	// --explain was asked about but about everything the sandbox confined, which
+	// the header has to say: the names a reader sees will not match the one they
+	// typed, and silence about that reads as a bug.
+	showsProc := false
+	for _, d := range ds {
+		if d.proc != "" {
+			showsProc = true
+			break
+		}
+	}
+	scope := procName + ", kernel log, "
+	if showsProc {
+		// Short enough that the rule still reaches the column width; the
+		// sentence under the table says what "all confined" means.
+		scope = "kernel log, all confined, "
+	}
 	var b strings.Builder
 	b.WriteString("\n")
 	b.WriteString(emit.SectionNote(st, st.Dim, runColumns(), "sandbox refusals",
-		procName+", kernel log, "+since.Local().Format(stamp)+" to "+until.Local().Format(stamp)))
+		scope+since.Local().Format(stamp)+" to "+until.Local().Format(stamp)))
 	if len(ds) == 0 {
 		b.WriteString(green + "  nothing was refused for " + procName + " in this window." + st.Reset + "\n")
-		b.WriteString(dim + "  So the failure is not the sandbox: look at what the program printed." + st.Reset + "\n")
+		b.WriteString(dim + "  No other confined process was refused either, so the failure is not the" +
+			" sandbox: look at what the program printed." + st.Reset + "\n")
 		return b.String()
 	}
 	dropped := 0
@@ -260,7 +308,8 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 	}
 	// Widths in runes, counted once on the plain text, so every row lines up
 	// without a second pass and colour cannot disturb them.
-	countW, opW, targetW := displayWidth("count"), displayWidth("operation"), displayWidth("target")
+	countW, procW, opW, targetW := displayWidth("count"), displayWidth("process"), displayWidth("operation"), displayWidth("target")
+	procs := make([]string, len(ds))
 	targets := make([]string, len(ds))
 	counts := make([]string, len(ds))
 	notes := make([]string, len(ds))
@@ -268,6 +317,10 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 	for i, d := range ds {
 		counts[i] = fmt.Sprintf("%d", d.count)
 		countW = max(countW, displayWidth(counts[i]))
+		procs[i] = d.proc
+		if showsProc {
+			procW = max(procW, displayWidth(procs[i]))
+		}
 		opW = max(opW, displayWidth(d.op))
 		targets[i] = truncTarget(d.target)
 		if targets[i] == "" {
@@ -277,8 +330,12 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 		notes[i], levels[i] = adviceFor(d.op, d.target)
 	}
 	const gap = "  "
-	writeRow := func(rowStyle, count, op, target, note, noteStyle string) {
-		b.WriteString("  " + rowStyle + padLeft(count, countW) + gap + padRight(op, opW) + gap)
+	writeRow := func(rowStyle, count, proc, op, target, note, noteStyle string) {
+		head := padLeft(count, countW) + gap
+		if showsProc {
+			head += padRight(proc, procW) + gap
+		}
+		b.WriteString("  " + rowStyle + head + padRight(op, opW) + gap)
 		if note == "" {
 			b.WriteString(target)
 		} else {
@@ -289,13 +346,13 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 		}
 		b.WriteString("\n")
 	}
-	writeRow(dim, "count", "operation", "target", "notes", "")
+	writeRow(dim, "count", "process", "operation", "target", "notes", "")
 	prevNote := ""
 	for i, d := range ds {
 		// A note repeated under the same operation reads as clutter; once is
 		// enough to say what to do about the whole run of rows.
 		note := notes[i]
-		if i > 0 && note != "" && note == prevNote && d.op == ds[i-1].op {
+		if i > 0 && note != "" && note == prevNote && d.op == ds[i-1].op && d.proc == ds[i-1].proc {
 			note = ""
 		}
 		prevNote = notes[i]
@@ -308,7 +365,7 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 		case noteExpected:
 			rowStyle = dim
 		}
-		writeRow(rowStyle, counts[i], d.op, targets[i], note, noteStyle)
+		writeRow(rowStyle, counts[i], procs[i], d.op, targets[i], note, noteStyle)
 	}
 	if dropped > 0 {
 		fmt.Fprintf(&b, "%s  and %d more, least refused first%s\n", dim, dropped, st.Reset)
@@ -354,14 +411,420 @@ func plural(n int) string {
 	return "s"
 }
 
+// explainRequest is what --explain knows about the run it is reporting on.
+type explainRequest struct {
+	command string // the name the kernel logs for the program
+	// argv is the command as the user typed it, and baseFlags the flags already
+	// in effect, so the next-run line can be pasted as it stands. Secrets stay
+	// out of it: --canary-token and --pass-env are deliberately not
+	// reconstructed into a line the reader will paste into their history.
+	argv      []string
+	baseFlags []string
+	workdir   string // a refusal inside it is a protected path, not a missing grant
+	// eventsPath and agent name this run's own lines in the event log, which is
+	// where the destinations came from: the proxy decided them, not the kernel.
+	eventsPath string
+	agent      string
+	since      time.Time
+	until      time.Time
+}
+
+// maxPlanGrants bounds the paste line. Past this the program wants the machine,
+// and a longer command is not the answer to that.
+const maxPlanGrants = 8
+
+// grantPlan is the actionable half of --explain: the flags that would have
+// stopped each refusal, derived from what the program actually asked for rather
+// than from what the reader guessed it would need.
+type grantPlan struct {
+	ro, rw        []string
+	mkdir         []string // write grants that do not exist yet, so --rw would refuse them
+	notGrantable  int      // sockets, listeners, ioctls: no flag opens these
+	insideWorkdir int      // already writable; the profile protects them on purpose
+	inTemp        int      // /tmp is the run's own scratch, a decision of its own
+	overCap       int      // paths left out to keep the line readable
+}
+
+// grantKind says whether an operation is a path the reader can grant at all.
+// Everything else (an ioctl on a terminal, a unix socket, a listener, a mach
+// lookup) is refused by the shape of the profile, and no flag should open it.
+func grantKind(op string) (string, bool) {
+	switch {
+	case strings.HasPrefix(op, "file-read"), op == "file-test-existence":
+		return "ro", true
+	case strings.HasPrefix(op, "file-write"), strings.HasPrefix(op, "file-setmode"), op == "file-mknod":
+		return "rw", true
+	}
+	return "", false
+}
+
+// grantable reports whether run would accept the path as a grant. The tool's own
+// guard answers the broad ones; the depth floor is the same idea for the paths it
+// does not cover: /usr on its own is not something to grant to a program.
+func grantable(path string) bool {
+	if path == "" || !filepath.IsAbs(path) || mechanism.TooBroadToGrant(path) {
+		return false
+	}
+	return strings.Count(strings.TrimPrefix(filepath.Clean(path), "/"), "/") >= 1
+}
+
+// under reports whether path sits at or below root.
+func under(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	path, root = filepath.Clean(path), filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+// pathExists is the only question the plan asks the filesystem. It is a
+// variable so the plan can be tested, and so the guide can render a macOS
+// sample on a machine that has none of those paths.
+var pathExists = os.Stat
+
+// grantFor answers the only question the table leaves open: what do I pass so
+// this stops being refused. A directory is granted as itself, a file by its
+// containing directory (the sibling files are what make a directory usable, and
+// one dylib is never wanted alone), and where that is too broad to grant, the
+// file alone. Where the path does not exist the program was trying to create it,
+// so the answer is the nearest directory that does exist plus the mkdir that
+// fills the gap: run refuses a grant on a path that is not there.
+func grantFor(target string) (grant, mkdirOf string) {
+	candidate := filepath.Dir(target)
+	if fi, err := pathExists(target); err == nil && fi.IsDir() {
+		candidate = target
+	}
+	for d := candidate; ; d = filepath.Dir(d) {
+		if !grantable(d) {
+			break
+		}
+		if _, err := pathExists(d); err != nil {
+			continue // the program was trying to create this level too
+		}
+		if d == candidate {
+			return d, ""
+		}
+		return d, candidate
+	}
+	if grantable(target) {
+		return target, ""
+	}
+	return "", ""
+}
+
+// privateTempDirs are the world-writable scratch directories the sandbox keeps
+// to itself. A program refused there is not missing a grant: the run already
+// gave it a private TMPDIR, and --rw /tmp would open the shared one to every
+// other process on the machine, so the plan reports it rather than offering it.
+var privateTempDirs = []string{"/tmp", "/private/tmp"}
+
+func inPrivateTemp(target string) bool {
+	for _, dir := range privateTempDirs {
+		if under(target, dir) {
+			return true
+		}
+	}
+	return false
+}
+
+// planGrants turns refusals into the least set of flags that covers them.
+func planGrants(ds []denial, workdir string) grantPlan {
+	var p grantPlan
+	reads, writes := map[string]bool{}, map[string]bool{}
+	for _, d := range ds {
+		kind, ok := grantKind(d.op)
+		if !ok || !strings.HasPrefix(d.target, "/") {
+			p.notGrantable++
+			continue
+		}
+		if strings.ContainsAny(d.target, " \t\r\n*?[]") {
+			// The runner cannot pass it safely, so it is not a grant either.
+			p.notGrantable++
+			continue
+		}
+		if under(d.target, workdir) {
+			p.insideWorkdir++
+			continue
+		}
+		if inPrivateTemp(d.target) {
+			p.inTemp++
+			continue
+		}
+		grant, mkdirOf := grantFor(d.target)
+		if grant == "" {
+			p.notGrantable++
+			continue
+		}
+		if kind == "ro" {
+			reads[grant] = true
+			continue
+		}
+		writes[grant] = true
+		if mkdirOf != "" {
+			p.mkdir = append(p.mkdir, mkdirOf)
+		}
+	}
+	p.ro, p.overCap = cappedSorted(reads, p.overCap)
+	var extra int
+	p.rw, extra = cappedSorted(writes, extra)
+	p.overCap += extra
+	slices.Sort(p.mkdir)
+	p.mkdir = slices.Compact(p.mkdir)
+	return p
+}
+
+// cappedSorted sorts a set of paths and keeps the first max, reporting how many
+// did not fit. Sorted rather than first-seen so the line is the same whatever
+// order the kernel logged the refusals in.
+func cappedSorted(set map[string]bool, already int) ([]string, int) {
+	all := make([]string, 0, len(set))
+	for k := range set {
+		all = append(all, k)
+	}
+	slices.Sort(all)
+	if len(all) > maxPlanGrants {
+		return all[:maxPlanGrants], already + len(all) - maxPlanGrants
+	}
+	return all, already
+}
+
+// quoteArg single-quotes what the shell would otherwise expand, the same
+// discipline the observe summary uses for its ALLOW line.
+func quoteArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\"'\\$&|;()<>") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// maxPlanHosts bounds the recommended allow-list for the same reason as
+// maxPlanGrants: past a handful the answer is not a longer command line.
+const maxPlanHosts = 8
+
+// hostPlan is the network half of the next run: the destinations this run's own
+// proxy events say the program reached for. It is read from the event log rather
+// than guessed at, because the proxy decided every one of them and wrote it down.
+type hostPlan struct {
+	allows, ports, privHosts []string
+	// refused counts destinations that were never grantable in the first place:
+	// canary and redirector hosts the proxy singled out, and loopback, which the
+	// sandbox keeps to itself. Recommending them would undo the point.
+	refused int
+	overCap int
+}
+
+// planAllows reads this run's events and answers what to pass --allow next time.
+// Only connect decisions count: a name the program looked up and never dialled is
+// not something to open. Anything already in baseFlags is left out, so the line
+// adds what is missing instead of repeating what was there.
+func planAllows(req explainRequest) hostPlan {
+	var p hostPlan
+	f, err := os.Open(req.eventsPath)
+	if err != nil {
+		return p
+	}
+	defer f.Close()
+	evs, _ := events.Read(f)
+	want, wantPort, wantPriv := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, e := range evs {
+		if e.Kind != events.KindConnect || e.Host == "" {
+			continue
+		}
+		if req.agent != "" && e.Agent != req.agent {
+			continue
+		}
+		if e.Time.Before(req.since.Add(-2*time.Second)) || e.Time.After(req.until.Add(2*time.Second)) {
+			continue
+		}
+		if e.Canary != "" || e.Relay != "" || strings.Contains(e.Reason, "canary") {
+			p.refused++
+			continue
+		}
+		if isLoopbackName(e.Host) {
+			p.refused++
+			continue
+		}
+		want[e.Host] = true
+		if e.Port != "" && e.Port != "443" && e.Port != "80" {
+			wantPort[e.Port] = true
+		}
+		if strings.HasPrefix(e.Reason, "resolved to non-public") {
+			wantPriv[e.Host] = true
+		}
+	}
+	var over int
+	p.allows, over = capped(sortedSet(want), over)
+	for h := range wantPriv {
+		if !want[h] {
+			delete(wantPriv, h)
+		}
+	}
+	p.privHosts, over = capped(sortedSet(wantPriv), over)
+	p.ports, over = capped(sortedSet(wantPort), over)
+	p.overCap = over
+	return p
+}
+
+// isLoopbackName reports the hostnames that mean this machine. Binding or
+// dialling loopback is refused whatever the allow-list says, so a grant is the
+// wrong answer to it.
+func isLoopbackName(host string) bool {
+	switch host {
+	case "localhost", "localhost.", "ip6-localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return strings.HasPrefix(host, "127.")
+}
+
+func sortedSet(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// capped keeps the first max of a sorted list and carries the count that fell off.
+func capped(all []string, already int) ([]string, int) {
+	if len(all) > maxPlanHosts {
+		return all[:maxPlanHosts], already + len(all) - maxPlanHosts
+	}
+	return all, already
+}
+
+// flagsValues pulls the values a repeatable flag took out of a reconstructed
+// command line, so the plan does not offer what the run already had.
+func flagsValues(flags []string, flag string) map[string]bool {
+	out := map[string]bool{}
+	for i, f := range flags {
+		if f == flag && i+1 < len(flags) {
+			out[flags[i+1]] = true
+		}
+	}
+	return out
+}
+
+// formatNextRun prints the pasteable answer. It reads as the proxy's observe
+// tail does, because the two are the same act on the two planes the sandbox
+// enforces: destinations there, paths here.
+func formatNextRun(g grantPlan, h hostPlan, req explainRequest, st emit.Styles) string {
+	var b strings.Builder
+	b.WriteString("\n")
+	existing := flagsValues(req.baseFlags, "--ro")
+	ro := make([]string, 0, len(g.ro))
+	for _, p := range g.ro {
+		if !existing[p] {
+			ro = append(ro, p)
+		}
+	}
+	existingRw := flagsValues(req.baseFlags, "--rw")
+	rw := make([]string, 0, len(g.rw))
+	for _, p := range g.rw {
+		if !existingRw[p] {
+			rw = append(rw, p)
+		}
+	}
+	have := flagsValues(req.baseFlags, "--allow")
+	allows := make([]string, 0, len(h.allows))
+	for _, host := range h.allows {
+		if !have[host] {
+			allows = append(allows, host)
+		}
+	}
+	total := len(ro) + len(rw) + len(allows) + len(h.ports) + len(h.privHosts)
+	note := fmt.Sprintf("%d grant%s, %d host%s", len(ro)+len(rw), plural(len(ro)+len(rw)),
+		len(allows)+len(h.ports)+len(h.privHosts), plural(len(allows)+len(h.ports)+len(h.privHosts)))
+	noteStyle := st.Yellow // this is the part the reader can act on
+	if total == 0 {
+		note, noteStyle = "nothing to add", st.Dim
+	}
+	b.WriteString(emit.SectionNote(st, noteStyle, runColumns(), "next run", note))
+	if total == 0 {
+		line(&b, st, "  Nothing above is one flag away; what follows says why each refusal is not.")
+	} else {
+		line(&b, st, "  The least that covers everything above, as one command:")
+		cmd := append([]string{"sandboxcheckr", "run", "--explain"}, req.baseFlags...)
+		for _, host := range allows {
+			cmd = append(cmd, "--allow", host)
+		}
+		for _, port := range h.ports {
+			cmd = append(cmd, "--allow-port", port)
+		}
+		for _, host := range h.privHosts {
+			cmd = append(cmd, "--allow-private-host", host)
+		}
+		for _, p := range ro {
+			cmd = append(cmd, "--ro", p)
+		}
+		for _, p := range rw {
+			cmd = append(cmd, "--rw", p)
+		}
+		cmd = append(cmd, req.argv...)
+		quoted := make([]string, len(cmd))
+		for i, a := range cmd {
+			quoted[i] = quoteArg(a)
+		}
+		b.WriteString("  " + st.Bold + strings.Join(quoted, " ") + st.Reset + "\n")
+	}
+	for _, m := range g.mkdir {
+		line(&b, st, "  a --rw path has to exist first: mkdir -p %s", quoteArg(m))
+	}
+	if g.notGrantable > 0 {
+		line(&b, st, "  %d refusal%s %s refused by design: a socket, a listener, a terminal ioctl.",
+			g.notGrantable, plural(g.notGrantable), isAre(g.notGrantable))
+	}
+	if g.insideWorkdir > 0 {
+		line(&b, st, "  %d refusal%s %s inside the workdir, where .git and .env are protected on purpose.",
+			g.insideWorkdir, plural(g.insideWorkdir), isAre(g.insideWorkdir))
+	}
+	if g.inTemp > 0 {
+		line(&b, st, "  %d refusal%s %s in the shared /tmp: the run has a private TMPDIR, and --rw /tmp "+
+			"would open that one.", g.inTemp, plural(g.inTemp), isAre(g.inTemp))
+	}
+	if g.overCap > 0 {
+		line(&b, st, "  %d further path%s %s in the table above, left out of the line.",
+			g.overCap, plural(g.overCap), isAre(g.overCap))
+	}
+	if h.refused > 0 {
+		line(&b, st, "  %d destination%s %s a canary, a redirector or loopback: those stay refused.",
+			h.refused, plural(h.refused), wasWere(h.refused))
+	}
+	if h.overCap > 0 {
+		line(&b, st, "  %d more host%s %s in the destinations table, left out of the line.",
+			h.overCap, plural(h.overCap), isAre(h.overCap))
+	}
+	return b.String()
+}
+
+// isAre and wasWere agree with the count each footnote starts with. "1 refusal
+// are" is the kind of thing a reader notices more than the fact they came to
+// read, and these lines are read one at a time, not against a legend.
+func isAre(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
+}
+
+func wasWere(n int) string {
+	if n == 1 {
+		return "was"
+	}
+	return "were"
+}
+
 // queryKernelLog is the log query, a variable so the report can be tested on a
 // platform that has no unified log.
 var queryKernelLog = kernelLogDenials
 
-// printRunExplain reports what the sandbox refused during the run. It runs
-// after the child has exited and after the proxy's own summary, so it is the
-// last thing a failed run prints.
-func printRunExplain(w io.Writer, commandName string, since, until time.Time, st emit.Styles) {
+// printRunExplain reports what the sandbox refused during the run, and what to
+// do about it. It runs after the child has exited and after the proxy's own
+// summary, so it is the last thing a failed run prints.
+func printRunExplain(w io.Writer, req explainRequest, st emit.Styles) {
 	// Whatever follows the proxy's own summary needs a line to itself first.
 	note := func(format string, args ...any) {
 		fmt.Fprint(w, "\n")
@@ -372,22 +835,51 @@ func printRunExplain(w io.Writer, commandName string, since, until time.Time, st
 			fmt.Fprintf(w, "%s%s%s\n", st.Dim, line, st.Reset)
 		}
 	}
-	procName := commandName
+	procName := req.command
+	// The proxy decided the destinations on every platform, so the half of the
+	// answer that comes from its log does not depend on the kernel log existing.
+	destinations := planAllows(req)
+	destinationsOnly := func() {
+		if len(destinations.allows)+len(destinations.ports)+len(destinations.privHosts) > 0 {
+			fmt.Fprint(w, formatNextRun(grantPlan{}, destinations, req, st))
+		}
+	}
 	if !safeProcessName.MatchString(procName) {
 		note("cannot search the kernel log for a process named %q; a name has to be a plain executable name", procName)
+		destinationsOnly()
 		return
 	}
-	lines, err := queryKernelLog(procName, since, until)
+	lines, err := queryKernelLog(req.since, req.until)
 	switch {
 	case errors.Is(err, errExplainUnsupported):
 		note("%s", "--explain reads the macOS kernel log, and the Linux sandbox has none: bubblewrap\n"+
 			"  refuses inside a namespace and a seccomp filter that log nothing, so the program\n"+
-			"  simply gets EPERM. The proxy's table above is what this platform can tell you.")
+			"  simply gets EPERM. The proxy's table above and the allow-list below are what this\n"+
+			"  platform can tell you.")
+		destinationsOnly()
 		return
 	case err != nil:
 		note("could not read the kernel log: %v", err)
+		destinationsOnly()
 		return
 	}
-	ds, hidden := aggregateDenials(lines, procName)
-	fmt.Fprint(w, formatDenials(ds, hidden, procName, since, until, st))
+	own, hidden, others := aggregateDenials(lines, procName)
+	if len(own) == 0 && len(others) > 0 {
+		// The program asked for nothing itself, so the refusals that matter are
+		// the ones logged against something else the sandbox confined. Saying
+		// "nothing was refused" here would be the worst sentence in the output:
+		// it reads as a clean bill of health for the thing that just stopped the
+		// program from starting.
+		fmt.Fprint(w, formatDenials(others, hidden, procName, req.since, req.until, st))
+		note("%s asked for nothing itself, but the sandbox confines everything it starts and the\n"+
+			"  kernel names the process that asked: a shell script is logged as bash, its helpers\n"+
+			"  under their own names. These are every refusal in the window, so a process confined\n"+
+			"  by something else on this machine can appear; act on the paths this program needed.", procName)
+		fmt.Fprint(w, formatNextRun(planGrants(others, req.workdir), destinations, req, st))
+		return
+	}
+	fmt.Fprint(w, formatDenials(own, hidden, procName, req.since, req.until, st))
+	if len(own) > 0 || len(destinations.allows)+len(destinations.ports)+len(destinations.privHosts) > 0 {
+		fmt.Fprint(w, formatNextRun(planGrants(own, req.workdir), destinations, req, st))
+	}
 }

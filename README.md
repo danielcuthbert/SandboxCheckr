@@ -52,11 +52,14 @@ and prints the missing `allow`, `allow-port` and `allow-private-host` lines
 for your review; `--write` puts them in `sandboxcheckr.toml`. It never
 proposes canary hosts, and a denied enforcing run feeds it just as well.
 
-When a program fails without ever reaching the network, `run --explain` asks the
-kernel afterwards what the sandbox refused from it: the ioctl on the terminal,
-the write outside the workdir, the connect to a unix socket. Those refusals are
-logged on macOS and nowhere a normal user can read on Linux, where the flag says
-so rather than printing an empty table.
+When you do not know what a program needs, `run --explain` finds out: it runs
+the program, stops it after two minutes if it never exits (`--timeout`), and
+prints the refusals the kernel logged next to the destinations the proxy
+decided, ending with the least set of `--allow`, `--ro` and `--rw` flags that
+would have covered them, as one command to paste. Sockets, listeners, terminal
+ioctls, canary hits and `/tmp` are refused on purpose and are not offered. Those
+refusals are logged on macOS and nowhere a normal user can read on Linux, where
+the flag says so and still offers the allow-list the proxy's own log supports.
 
 Observe mode permits ordinary destinations while logging them. It still blocks
 canary trips. You can narrow an allowed HTTP host to methods and paths with

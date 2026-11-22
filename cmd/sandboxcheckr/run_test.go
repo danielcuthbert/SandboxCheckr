@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -386,5 +388,90 @@ func TestParseBindPorts(t *testing.T) {
 		if _, err := parseBindPorts(bad); err == nil {
 			t.Fatalf("parseBindPorts(%q) accepted an invalid port", bad)
 		}
+	}
+}
+
+// A discovery run has to end, and ending it has to mean the program is gone:
+// these two are the promise --explain makes when it prints a report for a
+// program that never exited.
+
+func TestRunDeadlineStopsAProgramThatNeverExits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process groups and signals are unix; the deadline kills the runner alone elsewhere")
+	}
+	project := t.TempDir()
+	// 121 rather than 120 so a leftover from an earlier run of this test cannot
+	// be confused with this one's.
+	marker := "sleep 121"
+	code := runSandbox([]string{"--workdir", project, "--timeout", "1s", "/bin/sh", "-c", marker + " & " + marker})
+	if code != 124 {
+		// Distinguish a machine with no working sandbox from a deadline that
+		// does not fire: the same command, allowed to finish.
+		if plain := runSandbox([]string{"--workdir", project, "/bin/sh", "-c", "exit 0"}); plain != 0 {
+			t.Skipf("no working sandbox here (a plain run exited %d), so the deadline cannot be judged", plain)
+		}
+		t.Fatalf("exit status = %d, want timeout(1)'s 124 for a stopped run", code)
+	}
+	pgrep, err := exec.LookPath("pgrep")
+	if err != nil {
+		return // nothing to check with; the exit status is the only evidence
+	}
+	out, err := exec.Command(pgrep, "-f", marker).Output()
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		t.Errorf("the deadline stopped the program but left its tree running: %s", strings.TrimSpace(string(out)))
+	}
+}
+
+func TestRunFlagsForReproducesThePolicy(t *testing.T) {
+	o := &runOptions{
+		allows:       multiFlag{"example.com"},
+		rules:        multiFlag{"api.github.com:GET"},
+		ports:        multiFlag{"8443"},
+		privHosts:    multiFlag{"inference.internal"},
+		canaryTokens: multiFlag{"secret.canary.example"},
+		observe:      true,
+	}
+	flags := runFlagsFor("curl", o, []string{"/opt/local/lib"}, []string{"/home/daniel/.local/share/raptor"})
+	got := strings.Join(flags, " ")
+	for _, want := range []string{"--allow example.com", "--rule api.github.com:GET", "--allow-port 8443",
+		"--allow-private-host inference.internal", "--observe", "--ro /opt/local/lib", "--rw /home/daniel/.local/share/raptor"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the reconstructed run is missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "canary") {
+		t.Errorf("a token host belongs in the run, not in a line the reader pastes: %s", got)
+	}
+	// The convenience endpoints the run actually got are part of the policy too.
+	if claude := strings.Join(runFlagsFor("claude", &runOptions{}, nil, nil), " "); !strings.Contains(claude, "--allow api.anthropic.com") {
+		t.Errorf("a Claude run's endpoint should be in its own reconstruction: %s", claude)
+	}
+}
+
+func TestDiedOnASignalLooksLikeTheSandbox(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no signals to die on")
+	}
+	cases := []struct {
+		command string
+		want    bool
+	}{
+		{"kill -TERM $$", true}, // a program killed by a signal
+		{"exit 134", true},      // the runner shell reporting 128+SIGABRT
+		{"exit 143", true},      // 128+SIGTERM
+		{"exit 126", true},      // the shell could not execute it
+		{"exit 127", true},      // not found
+		{"exit 0", false},       // a program that worked
+		{"exit 3", false},       // a program that failed on its own: grep finds nothing
+		{"exit 200", false},     // not a signal shape
+	}
+	for _, c := range cases {
+		err := exec.Command("/bin/sh", "-c", c.command).Run()
+		if got := diedOnASignal(err); got != c.want {
+			t.Errorf("diedOnASignal(%q) = %v, want %v", c.command, got, c.want)
+		}
+	}
+	if diedOnASignal(nil) {
+		t.Error("no error is not a signal")
 	}
 }

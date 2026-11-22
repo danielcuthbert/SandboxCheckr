@@ -392,12 +392,18 @@ anonymous writes, no WebDAV, upstreams pinned, per-agent read-only tokens.
 
 The destinations table only shows what reached the proxy. A program the sandbox
 stops on a syscall never gets there, and the run says "no destinations were
-contacted", which is the least useful sentence in the output. `--explain` asks
-the kernel afterwards what it refused from that program:
+contacted", which is the least useful sentence in the output. `--explain` is how
+you find out what a program wanted without knowing in advance:
 
 ```sh
-sandboxcheckr run --explain codex --no-daemon
+sandboxcheckr run --explain ./bin/raptor
 ```
+
+It runs the program in the sandbox, stops it after two minutes if it has not
+finished (`--timeout`, or `--timeout 0` to wait for it), and prints what the
+kernel refused next to the destinations the proxy decided. On macOS that means
+the unified log for the run's window; the run exits 124 when the deadline ended
+it rather than the program.
 
 ```
 ── SANDBOX REFUSALS  codex, kernel log, 08:03:59 to 08:04:06  ────────────
@@ -417,13 +423,62 @@ the twenty-first row onwards is summarised rather than printed; and the things
 we have watched programs ignore are folded into the last line with their count,
 so nobody has to read past the noise to find the refusal that matters.
 
-It reads the macOS unified log across the run's window, so it is macOS only and
-costs a second or two; on Linux the sandbox refuses with nothing logged, and
-`--explain` says so instead of printing an empty table that reads as clean.
+The kernel writes a refusal against the process that asked, not the one you
+typed. A shell script and the helpers it runs are logged as `bash`, `node`,
+`python3` and whatever else they exec, so a program that asked for nothing
+itself has an empty table and a `process` column instead of a clean bill of
+health:
+
+```
+── SANDBOX REFUSALS  kernel log, all confined, 09:21:42 to 09:21:51  ─────
+  count  process  operation          target                                        notes
+      2  clear    file-read-data     /opt/local/lib/libncurses.6.dylib             outside the workdir; add --ro <dir>
+      1  bash     file-write-create  /tmp/claude-501                               outside the workdir; add --rw <dir>
+      1  node     file-write-create  /Users/daniel/.local/share/raptor/sessions.d  outside the workdir; add --rw <dir>
+
+raptor asked for nothing itself, but the sandbox confines everything it starts and the
+  kernel names the process that asked: a shell script is logged as bash, its helpers
+  under their own names. These are every refusal in the window, so a process confined
+  by something else on this machine can appear; act on the paths this program needed.
+
+── NEXT RUN  2 grants, 1 host ────────────────────────────────────────────
+  The least that covers everything above, as one command:
+  sandboxcheckr run --explain --deny-all --allow api.anthropic.com --ro /opt/local/lib --rw /Users/daniel/.local/share/raptor ./bin/raptor
+  1 refusal is in the shared /tmp: the run has a private TMPDIR, and --rw /tmp would open that one.
+  1 destination was a canary, a redirector or loopback: those stay refused.
+```
+
+The last section is the one to use. A refused file becomes its containing
+directory, because one dylib is never wanted alone; a refused directory that
+does not exist yet becomes its nearest parent that does, with the `mkdir` the
+program was trying to make; and the destinations come from this run's own lines
+in the event log, filtered by the run's agent label so another agent's run in
+the same log cannot rub off on the recommendation. The flags the run already had
+are reproduced, minus the ones that should not be repeated into a shell history:
+canary tokens and `--pass-env` names stay out.
+
+What it refuses to offer is the point of the section. A unix socket, a listener
+and a terminal ioctl are refused because the profile means to refuse them, so no
+flag appears for them; canary hits, URL shorteners and loopback are hosts the
+proxy picked out for itself, and recommending `--allow` for them would undo the
+detection. A path inside the workdir is the profile protecting `.git` or `.env`,
+not a missing grant. And `/tmp` stays out of the line because the run already
+has a private `TMPDIR`, while `--rw /tmp` would open the world-writable one.
+
+It reads the macOS unified log across the run's window, so the refusals half is
+macOS only and costs a second or two; on Linux the sandbox refuses with nothing
+logged, and `--explain` says so rather than printing an empty table that reads
+as clean, then still offers the allow-list the proxy's own log supports.
 Colour follows the same rule as the rest of the tool: on for a terminal, off
 when piped, `--no-color` to force it off. A yellow note names a grant you can
 add; rows the profile refuses on purpose (a unix socket, a listener) are dimmed,
 so what's worth acting on is what stands out.
+
+One thing the report cannot show is what the sandbox let through quietly: a read
+inside the workdir leaves no trace because nothing refused it. The table is the
+record of what the program wanted and did not get, which is the half you need
+when deciding what to grant. If a program was killed by a signal without
+`--explain`, the run says so and points here.
 
 ### The console: where each agent went
 

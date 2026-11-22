@@ -9,6 +9,6 @@ import "time"
 // logged anywhere a normal user can read: the program simply gets EPERM. The
 // caller turns this into a plain statement rather than an empty table, which
 // would read as "nothing was refused".
-func kernelLogDenials(string, time.Time, time.Time) ([]string, error) {
+func kernelLogDenials(since, until time.Time) ([]string, error) {
 	return nil, errExplainUnsupported
 }

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -79,10 +80,16 @@ under ~/.local/state/sandboxcheckr/projects/, and "sandboxcheckr console"
 run in the same project reads it back. --events chooses an explicit file.
 
 The proxy's table shows destinations, so a program the sandbox stops before it
-reaches the network shows nothing there. --explain asks the kernel afterwards
-what it refused from that program: the ioctl on the terminal, the write outside
-the workdir, the connect to a unix socket. macOS only, where those refusals are
-logged; on Linux the sandbox says nothing and --explain says so.
+reaches the network shows nothing there. --explain is for finding out what a
+program wanted without knowing in advance: it runs the program, stops it after
+two minutes if it has not finished (--timeout, or --timeout 0 to wait), and
+prints the refusals the kernel logged next to the destinations the proxy
+decided, then the least set of --allow, --ro and --rw flags that would have
+covered them as one command to paste. A unix socket, a listener, a terminal
+ioctl, a canary hit and /tmp are deliberately not offered: they are refused
+because the sandbox means to refuse them. The kernel log is macOS only; on Linux
+the sandbox says nothing and --explain says so, then still offers the allow-list
+the proxy's own log supports.
 
 FLAGS
 `
@@ -128,6 +135,17 @@ const pathHelp = `The command is looked up in this shell's PATH, as it would be 
   - check the search path with: echo $PATH
 `
 
+// explainProbeLimit is the deadline --explain arms when the reader did not set
+// one. Long enough for an agent CLI to get through a turn, short enough that a
+// program which never exits (a server, a prompt waiting for input) still
+// produces the report the flag exists for.
+const explainProbeLimit = 2 * time.Minute
+
+// runStopGrace is how long a run being stopped gets to clean up after SIGTERM
+// before its whole group is killed. The runner shell's trap stops the proxy on
+// the way out, and the proxy's own summary is worth waiting a moment for.
+const runStopGrace = 5 * time.Second
+
 // runOptions holds run's parsed flags. A project's sandboxcheckr.toml is
 // merged into it before validation, so the rest of the pipeline sees one
 // policy regardless of where each value came from.
@@ -136,6 +154,7 @@ type runOptions struct {
 	canaryTokens                                    multiFlag
 	observe, canaryKill, noCanary, noAgentAuth      bool
 	explain                                         bool
+	timeout                                         time.Duration
 	events, agent, denyFile                         string
 }
 
@@ -160,7 +179,8 @@ func runSandbox(args []string) int {
 	fs.BoolVar(&o.noCanary, "no-canary", false, "disable canary credentials (the proxy prints this)")
 	fs.Var(&o.canaryTokens, "canary-token", "external canary token `host` (a DNS token from canarytokens.org) or `name=value` to watch a string; repeatable. Lookups of the token host and connections to it are forwarded so the token service alerts, and every use trips at high confidence")
 	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
-	fs.BoolVar(&o.explain, "explain", false, "after the run, report what the sandbox refused from the program (macOS kernel log)")
+	fs.BoolVar(&o.explain, "explain", false, "after the run, report what the sandbox refused, what the program reached for, and the command to run next")
+	fs.DurationVar(&o.timeout, "timeout", 0, "stop the program after this long and report anyway (`duration`; 0 runs it to completion, --explain defaults to 2m)")
 	noColor := fs.Bool("no-color", false, "force ANSI colour off in the exit summary (otherwise auto: on for a terminal, off when piped)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -359,6 +379,14 @@ func runSandbox(args []string) int {
 	passNames := []string(o.passes)
 	rwPaths := []string(o.rw)
 	commandName := filepath.Base(argv[0])
+	// The proxy's own default label is its command and pid, which names the
+	// proxy rather than the run. --explain reads this run's events back to say
+	// what to allow next time, so the label has to identify the run, and only
+	// run knows which one that is.
+	agentLabel := o.agent
+	if agentLabel == "" {
+		agentLabel = commandName + "-" + strconv.Itoa(os.Getpid())
+	}
 
 	// A detected virtualenv becomes visible inside the sandbox: its directory
 	// is bound read-only and its bin directory goes first on PATH, so the
@@ -466,9 +494,7 @@ func runSandbox(args []string) int {
 		}
 	}
 	env = replaceEnv(env, "EVENTS", o.events)
-	if o.agent != "" {
-		env = replaceEnv(env, "AGENT", o.agent)
-	}
+	env = replaceEnv(env, "AGENT", agentLabel)
 	if o.denyFile != "" {
 		env = replaceEnv(env, "DENY_FILE", o.denyFile)
 	}
@@ -510,6 +536,17 @@ func runSandbox(args []string) int {
 	// proxy arms its own PDEATHSIG against that shell, so the whole chain —
 	// run, runner, proxy, sandbox — dies together.
 	armRunnerPdeathsig(cmd)
+	// A discovery run has to end. The report is the point of --explain, and a
+	// program that never exits (a server, an agent waiting for a prompt) would
+	// print nothing at all, so --explain implies a deadline. The reader can set
+	// their own, or pass 0 to wait for a program that finishes by itself.
+	deadline := o.timeout
+	if deadline == 0 && o.explain && !set["timeout"] {
+		deadline = explainProbeLimit
+	}
+	if deadline > 0 {
+		isolateRunGroup(cmd)
+	}
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "starting runner:", err)
 		return 1
@@ -521,22 +558,65 @@ func runSandbox(args []string) int {
 	go func() {
 		select {
 		case sig := <-signals:
-			_ = cmd.Process.Signal(sig)
+			signalRun(cmd, sig)
 		case <-done:
 		}
 	}()
+	var deadlineHit atomic.Bool
+	if deadline > 0 {
+		say("bounded run: the program is stopped after %s so the report can print (--timeout 0 runs it to completion)", deadline)
+		go func() {
+			timer := time.NewTimer(deadline)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				select {
+				case <-done:
+					return // it finished on its own; nothing was stopped
+				default:
+				}
+				deadlineHit.Store(true)
+				stopRun(cmd, runStopGrace, done)
+			case <-done:
+			}
+		}()
+	}
 	err = cmd.Wait()
 	close(done)
+	stoppedByDeadline := deadlineHit.Load() && err != nil
 	// If the runner died before its trap stopped the proxy, stop it here so
 	// the exit summary is printed after the child exits on every path.
 	stopOrphanedProxy(private)
+	if stoppedByDeadline {
+		say("the program was stopped after %s; what follows covers that window (--timeout 0 runs it to completion)", deadline)
+	}
 	if o.explain {
 		// Last, so it follows the proxy's own table: destinations first, then
 		// the refusals the proxy could never have seen.
-		printRunExplain(os.Stderr, commandName, started, time.Now(), summaryStyle())
+		printRunExplain(os.Stderr, explainRequest{
+			command:    commandName,
+			argv:       argv,
+			baseFlags:  runFlagsFor(commandName, o, []string(o.ro), rwPaths),
+			workdir:    project,
+			eventsPath: o.events,
+			agent:      agentLabel,
+			since:      started,
+			until:      time.Now(),
+		}, summaryStyle())
+	} else if !stoppedByDeadline && diedOnASignal(err) {
+		// The sandbox's refusals arrive as EPERM or a signal, and a program
+		// killed by one often says nothing about why. Point at the report that
+		// does, rather than leaving the reader to find --explain in the manual.
+		say("run it again with --explain: it lists what the sandbox refused and the\n" +
+			"  flags that would have let it through, which is what to pass next time.")
 	}
 	if err == nil {
 		return 0
+	}
+	if stoppedByDeadline {
+		// timeout(1)'s code for "the deadline, not the program, ended this": a
+		// script wrapping the run can tell a stopped probe from a failed one.
+		return 124
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -679,6 +759,52 @@ func validateGrant(path string) (string, error) {
 		return "", fmt.Errorf("grant path %q is too broad", abs)
 	}
 	return abs, nil
+}
+
+// runFlagsFor reconstructs the policy this run enforced, so --explain's next-run
+// command is pasteable as it stands: the same set the runner was handed, minus
+// what must not be repeated into a shell history. Canary tokens and --pass-env
+// names are left out for that reason, and because the line is a starting point
+// rather than a record of the run.
+func runFlagsFor(commandName string, o *runOptions, roPaths, rwPaths []string) []string {
+	flags := strings.Fields(allowFlagsFor(commandName, []string(o.allows), []string(o.rules),
+		[]string(o.ports), []string(o.privHosts)))
+	if o.observe {
+		flags = append(flags, "--observe")
+	}
+	for _, path := range unique(roPaths) {
+		flags = append(flags, "--ro", path)
+	}
+	// rwPaths carries the agent-state grants the tool added as well as the ones
+	// the reader typed: both were in effect, so both belong in a line that is
+	// meant to reproduce the run that just happened.
+	for _, path := range unique(rwPaths) {
+		flags = append(flags, "--rw", path)
+	}
+	return flags
+}
+
+// diedOnASignal reports the exit shapes the sandbox produces when it stops a
+// program: killed by a signal directly, the shell's 126 and 127 for a command it
+// could not execute, and 128+N for a signal the runner shell's child took. That
+// last one is the usual route: a confined helper that aborts in dyld reaches us
+// as 134, not as a signal on our own child. A plain non-zero exit is none of
+// these: grep returning 1 must not be advertised as a refusal.
+func diedOnASignal(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	if signalled(exitErr) {
+		return true
+	}
+	switch code := exitErr.ExitCode(); {
+	case code == 126, code == 127:
+		return true
+	case code >= 129 && code <= 165:
+		return true
+	}
+	return false
 }
 
 // mergeProjectConfig applies the project's sandboxcheckr.toml as the
