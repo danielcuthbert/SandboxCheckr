@@ -79,12 +79,12 @@ func runCanary(args []string) int {
 			return 1
 		}
 		if len(s.Credentials) == 0 {
-			fmt.Fprintln(os.Stderr, "sandboxcheckr: all canary groups skipped because real credentials or config paths were passed")
+			say("sandboxcheckr: all canary groups skipped because real credentials or config paths were passed")
 		} else {
-			fmt.Fprintln(os.Stderr, "sandboxcheckr: canaries active, run "+s.RunID)
+			say("sandboxcheckr: canaries active, run %s", s.RunID)
 		}
 		if n := countExternal(s); n > 0 {
-			fmt.Fprintf(os.Stderr, "sandboxcheckr: external canary tokens: %d (lookups of the token host and connections to it are forwarded so the token service alerts; every use trips at high confidence)\n", n)
+			say("sandboxcheckr: external canary tokens: %d (lookups of the token host and connections to it are forwarded so the token service alerts; every use trips at high confidence)", n)
 		}
 		return 0
 	case "env":
