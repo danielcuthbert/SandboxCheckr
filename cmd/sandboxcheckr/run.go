@@ -85,11 +85,15 @@ program wanted without knowing in advance: it runs the program, stops it after
 two minutes if it has not finished (--timeout, or --timeout 0 to wait), and
 prints the refusals the kernel logged next to the destinations the proxy
 decided, then the least set of --allow, --ro and --rw flags that would have
-covered them as one command to paste. A unix socket, a listener, a terminal
-ioctl, a canary hit and /tmp are deliberately not offered: they are refused
-because the sandbox means to refuse them. The kernel log is macOS only; on Linux
-the sandbox says nothing and --explain says so, then still offers the allow-list
-the proxy's own log supports.
+covered them as one command to paste. Each --explain records what it saw, in the
+project's refusal log (denials.jsonl) beside the event log, and the next run
+plans from the union over --across: a week by default, --across 0 for this run
+alone. One run is one sample of what a program touches; the union is the
+specification, and the report says which it planned from. A unix socket, a
+listener, a terminal ioctl, a canary hit and /tmp are deliberately not offered:
+they are refused because the sandbox means to refuse them. The kernel log is
+macOS only; on Linux the sandbox says nothing and --explain says so, then still
+offers the allow-list the proxy's own log supports.
 
 FLAGS
 `
@@ -155,6 +159,7 @@ type runOptions struct {
 	observe, canaryKill, noCanary, noAgentAuth      bool
 	explain                                         bool
 	timeout                                         time.Duration
+	across                                          time.Duration
 	events, agent, denyFile                         string
 }
 
@@ -181,6 +186,7 @@ func runSandbox(args []string) int {
 	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
 	fs.BoolVar(&o.explain, "explain", false, "after the run, report what the sandbox refused, what the program reached for, and the command to run next")
 	fs.DurationVar(&o.timeout, "timeout", 0, "stop the program after this long and report anyway (`duration`; 0 runs it to completion, --explain defaults to 2m)")
+	fs.DurationVar(&o.across, "across", 7*24*time.Hour, "with --explain, plan the grants from what this program was refused over this long (--across 0 plans from this run alone)")
 	noColor := fs.Bool("no-color", false, "force ANSI colour off in the exit summary (otherwise auto: on for a terminal, off when piped)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -204,6 +210,14 @@ func runSandbox(args []string) int {
 	if _, err := exec.LookPath(argv[0]); err != nil {
 		fmt.Fprintf(os.Stderr, "run: cannot find %q: %v\n%s", argv[0], err, pathHelp)
 		return 127
+	}
+	// Everything after the program is the program's own, which is how a --timeout
+	// typed at the end reaches the program instead of the deadline and a bounded
+	// probe still runs the full default. Only a name this command registers is
+	// worth saying anything about; any other --flag is the program's business.
+	if misplaced := runFlagsIn(argv[1:], fs); len(misplaced) > 0 {
+		sayWarn("%s after %s goes to the program, not to sandboxcheckr: put them before it to have them apply.",
+			strings.Join(misplaced, " "), argv[0])
 	}
 	project, err := filepath.Abs(*workdir)
 	if err != nil {
@@ -594,14 +608,16 @@ func runSandbox(args []string) int {
 		// Last, so it follows the proxy's own table: destinations first, then
 		// the refusals the proxy could never have seen.
 		printRunExplain(os.Stderr, explainRequest{
-			command:    commandName,
-			argv:       argv,
-			baseFlags:  runFlagsFor(commandName, o, []string(o.ro), rwPaths),
-			workdir:    project,
-			eventsPath: o.events,
-			agent:      agentLabel,
-			since:      started,
-			until:      time.Now(),
+			command:     commandName,
+			argv:        argv,
+			baseFlags:   runFlagsFor(commandName, o, []string(o.ro), rwPaths),
+			workdir:     project,
+			eventsPath:  o.events,
+			denialsPath: denialsLogFor(o.events),
+			across:      o.across,
+			agent:       agentLabel,
+			since:       started,
+			until:       time.Now(),
 		}, summaryStyle())
 	} else if !stoppedByDeadline && diedOnASignal(err) {
 		// The sandbox's refusals arrive as EPERM or a signal, and a program
@@ -761,6 +777,27 @@ func validateGrant(path string) (string, error) {
 	return abs, nil
 }
 
+// runFlagsIn names the arguments that collide with a flag this command
+// registers. A program's own --verbose is none of our business; --ro, --timeout
+// and the rest arriving after the program name is nearly always a flag that
+// meant to be ours and is about to be ignored by both sides.
+func runFlagsIn(args []string, fs *flag.FlagSet) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			continue
+		}
+		name := strings.SplitN(strings.TrimPrefix(a, "--"), "=", 2)[0]
+		if name == "" || seen[name] || fs.Lookup(name) == nil {
+			continue
+		}
+		seen[name] = true
+		out = append(out, "--"+name)
+	}
+	return out
+}
+
 // runFlagsFor reconstructs the policy this run enforced, so --explain's next-run
 // command is pasteable as it stands: the same set the runner was handed, minus
 // what must not be repeated into a shell history. Canary tokens and --pass-env
@@ -904,6 +941,17 @@ func projectEventsPath(project string) string {
 	}
 	sum := sha256.Sum256([]byte(project))
 	return filepath.Join(sandboxcheckrStateDir(), "projects", hex.EncodeToString(sum[:4]), "events.jsonl")
+}
+
+// denialsLogFor is where a project keeps what the sandbox refused: the same
+// directory as the event log, a different plane of evidence. The proxy decides
+// destinations and writes one; the kernel decides path refusals and the report
+// writes the other, so neither can overwrite the file the other is reading.
+func denialsLogFor(eventsPath string) string {
+	if eventsPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(eventsPath), "denials.jsonl")
 }
 
 // eventLogForRun resolves the event log for a run: an explicit path wins;

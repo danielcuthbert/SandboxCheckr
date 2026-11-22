@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danielcuthbert/sandboxcheckr/internal/denials"
 	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/events"
 )
@@ -516,10 +517,14 @@ func outsideTemp(t *testing.T) {
 }
 
 // fixtureTree makes the shapes a refusal can name: a directory, a file inside it,
-// a directory the program was trying to create, and a workdir of its own.
+// a directory the program was trying to create, and a workdir of its own. The
+// root is the home directory for the test because the plan only offers grants
+// inside the trees the run belongs to, and a fixture outside them would be
+// refused as a daemon's own files.
 func fixtureTree(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
+	t.Setenv("HOME", root)
 	for _, dir := range []string{"lib", "work", "home", "home/.local"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
@@ -650,6 +655,58 @@ func TestPlanGrantsKeepsScratchOutOfThePlan(t *testing.T) {
 	}
 }
 
+// fakeTree answers the plan's one filesystem question from a list, so a macOS
+// path can be planned on a machine that has never heard of MacPorts. Anything not
+// listed is missing, which is the answer that makes the plan name a mkdir.
+func fakeTree(dirs ...string) func(string) (os.FileInfo, error) {
+	set := map[string]bool{}
+	for _, d := range dirs {
+		set[filepath.Clean(d)] = true
+	}
+	return func(p string) (os.FileInfo, error) {
+		if set[filepath.Clean(p)] {
+			return fakeDir(filepath.Base(p)), nil
+		}
+		return nil, os.ErrNotExist
+	}
+}
+
+type fakeDir string
+
+func (d fakeDir) Name() string     { return string(d) }
+func (fakeDir) Size() int64        { return 0 }
+func (fakeDir) Mode() os.FileMode  { return os.ModeDir | 0o755 }
+func (fakeDir) ModTime() time.Time { return time.Time{} }
+func (fakeDir) IsDir() bool        { return true }
+func (fakeDir) Sys() any           { return nil }
+
+func TestPlanGrantsLeavesAServicesOwnFilesAlone(t *testing.T) {
+	// A confined window collects every process the sandbox holds, and the daemons
+	// in it have been refused for as long as the machine has been up. Offering
+	// their files would make the report the thing that widens the sandbox.
+	outsideTemp(t)
+	root := fixtureTree(t)
+	old := pathExists
+	defer func() { pathExists = old }()
+	pathExists = fakeTree("/opt/local/lib", "/private/var/db/timezone")
+	p := planGrants([]denial{
+		read("/opt/local/lib/libncurses.6.dylib"),
+		read("/Library/Application"),
+		read("/private/var/db/timezone/tz/2026f.1.0/zoneinfo/UTC"),
+		write("/private/var/db/locationd/Library/Keychains/foo"),
+		write("/private/var/folders/zz/zyxvpxvq/T/com.apple.x/thing"),
+	}, workOf(root))
+	if want := []string{"/opt/local/lib", "/private/var/db/timezone"}; !slices.Equal(p.ro, want) {
+		t.Errorf("ro = %v, want the package prefix and the timezone database, which a program of yours really does read", p.ro)
+	}
+	if len(p.rw) != 0 {
+		t.Errorf("rw = %v, want nothing: a service's tree is not this run's to open", p.rw)
+	}
+	if p.systemSpace != 3 {
+		t.Errorf("systemSpace = %d, want the daemon read and the two daemon writes said out loud", p.systemSpace)
+	}
+}
+
 func TestPlanGrantsCapsTheLine(t *testing.T) {
 	outsideTemp(t)
 	root := fixtureTree(t)
@@ -706,6 +763,63 @@ func TestPlanAllowsReadsTheRunsOwnDestinations(t *testing.T) {
 	}
 }
 
+// joined folds a wrapped paste line back into one, so an assertion is about what
+// the command says rather than where it happened to break.
+func joined(s string) string {
+	return strings.ReplaceAll(s, " \\\n      ", " ")
+}
+
+func TestWrapCommandKeepsTheBlockPasteable(t *testing.T) {
+	parts := []string{"sandboxcheckr", "run", "--explain"}
+	for i := range 12 {
+		parts = append(parts, "--ro", fmt.Sprintf("/Users/daniel/lib%d/thing.dylib", i))
+	}
+	parts = append(parts, "'./bin/raptor --prompt'", "'say hi there'")
+	const width = 60
+	lines := wrapCommand(parts, width)
+	if len(lines) < 2 {
+		t.Fatalf("a %d column command should break, got %d line:\n%v", width, len(lines), lines)
+	}
+	for _, l := range lines[:len(lines)-1] {
+		if !strings.HasSuffix(l, ` \`) {
+			t.Errorf("a broken line has to hand the shell a continuation: %q", l)
+		}
+		if len(l) > width {
+			t.Errorf("line longer than the column width: %q", l)
+		}
+	}
+	if strings.HasSuffix(lines[len(lines)-1], `\`) {
+		t.Errorf("the last line must not continue into nothing: %q", lines[len(lines)-1])
+	}
+	// The break may only fall between pieces, never inside a quoted one.
+	whole := joined(strings.Join(lines, "\n"))
+	for _, p := range parts {
+		if !strings.Contains(whole, p) {
+			t.Errorf("the break cut through %q:\n%v", p, lines)
+		}
+	}
+}
+
+func TestPairedKeepsAGrantOnOneSideOfABreak(t *testing.T) {
+	// A break between --ro and its path is not a cosmetic problem: the shell hands
+	// the next option to --ro as the grant, and the run fails in a way that looks
+	// like the plan was wrong.
+	flags := []string{"--deny-all"}
+	for i := range 8 {
+		flags = append(flags, "--ro", fmt.Sprintf("/Users/daniel/.local/share/tool%d/state", i))
+	}
+	pieces := append([]string{"sandboxcheckr", "run", "--explain"}, paired(flags)...)
+	lines := wrapCommand(pieces, 60)
+	if len(lines) < 2 {
+		t.Fatalf("these grants should not fit in 60 columns: %v", lines)
+	}
+	for _, l := range lines {
+		if strings.HasSuffix(l, "--ro \\") || strings.HasSuffix(l, "--rw \\") {
+			t.Errorf("a grant was split from its path: %q", l)
+		}
+	}
+}
+
 func TestFormatNextRunIsPasteable(t *testing.T) {
 	outsideTemp(t)
 	root := fixtureTree(t)
@@ -718,7 +832,7 @@ func TestFormatNextRunIsPasteable(t *testing.T) {
 		write(filepath.Join(root, "home", ".local", "share", "raptor", "sessions.d")),
 	}, workOf(root))
 	h := hostPlan{allows: []string{"api.example.com"}, ports: []string{"8443"}}
-	out := formatNextRun(g, h, req, emit.Styles{})
+	out := joined(formatNextRun(g, h, req, emit.Styles{}))
 	for _, want := range []string{
 		"sandboxcheckr run --explain --deny-all",
 		"--allow api.example.com",
@@ -769,7 +883,7 @@ func TestPrintRunExplainStillNamesTheHostsItReachedFor(t *testing.T) {
 			Reason: "resolved to non-public address 10.0.0.5; refusing (use --allow-private-host inference.internal to permit this host only)"})
 	var b strings.Builder
 	printRunExplain(&b, req, emit.Styles{})
-	out := b.String()
+	out := joined(b.String())
 	if !strings.Contains(out, "Linux sandbox has none") {
 		t.Errorf("the missing kernel log should still be said out loud:\n%s", out)
 	}
@@ -800,7 +914,7 @@ func TestPrintRunExplainEndsWithTheNextCommand(t *testing.T) {
 		events.Event{Time: time.Now(), Kind: events.KindConnect, Decision: events.Deny, Host: "api.example.com", Reason: "not in allow-list"})
 	var b strings.Builder
 	printRunExplain(&b, req, emit.Styles{})
-	out := b.String()
+	out := joined(b.String())
 	for _, want := range []string{
 		"NEXT RUN", "sandboxcheckr run --explain",
 		"--ro " + filepath.Join(root, "lib"),
@@ -810,6 +924,178 @@ func TestPrintRunExplainEndsWithTheNextCommand(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report must end with what to run next, missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// seedRefusals writes what earlier runs of one program were refused, so the
+// union can be tested without ten runs. op is the file-read shape; a write is
+// named by the target the caller chooses.
+func seedRefusals(t *testing.T, path, command, runID string, age time.Duration, targets ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	now := time.Now()
+	rows := make([]denials.Row, 0, len(targets))
+	for _, target := range targets {
+		rows = append(rows, denials.Row{Time: now.Add(-age), Command: command, Agent: command + "-1",
+			RunID: runID, Proc: "bash", Op: "file-read-data", Target: target, Count: 2})
+	}
+	if err := denials.Write(f, rows); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// raptorRequest is the shape of a --explain call on a fixture project, with the
+// refusal log in a directory of its own.
+func raptorRequest(t *testing.T, root string) explainRequest {
+	t.Helper()
+	req := explainFor("raptor")
+	req.agent = "raptor-1"
+	req.workdir = workOf(root)
+	req.argv = []string{"./bin/raptor"}
+	req.denialsPath = filepath.Join(t.TempDir(), "denials.jsonl")
+	req.across = 24 * time.Hour
+	return req
+}
+
+func TestExplainPlansFromEarlierRunsOfTheSameProgram(t *testing.T) {
+	// One run is one sample of what a program touches: a control fitted to it
+	// over-permits on one run and breaks on the next. The union over the runs is
+	// the specification, so a path only the earlier runs reached for still has
+	// to reach the line.
+	outsideTemp(t)
+	root := fixtureTree(t)
+	req := raptorRequest(t, root)
+	lib := filepath.Join(root, "lib", "libncurses.6.dylib")
+	other := filepath.Join(root, "lib", "libother.so")
+	seedRefusals(t, req.denialsPath, "raptor", "raptor-100@1", time.Hour, lib)
+	seedRefusals(t, req.denialsPath, "raptor", "raptor-101@2", 2*time.Hour, other)
+	// Out of the window, and another program's: neither belongs in this plan.
+	seedRefusals(t, req.denialsPath, "raptor", "raptor-90@0", 30*24*time.Hour, filepath.Join(root, "home", ".stale"))
+	seedRefusals(t, req.denialsPath, "codex", "codex-9@0", time.Hour, filepath.Join(root, "home", ".elsewhere"))
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{compactLine("mkdir", 4321, "file-write-create",
+			filepath.Join(root, "home", ".local", "share", "raptor", "sessions.d"))}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, req, emit.Styles{})
+	out := joined(b.String())
+	for _, want := range []string{
+		"--ro " + filepath.Join(root, "lib"), // named by the earlier runs only
+		"--rw " + filepath.Join(root, "home", ".local"),
+		"across 3 runs", // two seeded plus this one
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the plan should cover the union over runs, missing %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{".stale", ".elsewhere"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the plan reached past the window or past this program: %q:\n%s", bad, out)
+		}
+	}
+	// The two lib targets are one grant, not two: the plan is about paths.
+	if n := strings.Count(out, "--ro "+filepath.Join(root, "lib")); n != 1 {
+		t.Errorf("two refusals under the same directory should be one grant, got %d:\n%s", n, out)
+	}
+}
+
+func TestExplainAcrossZeroPlansFromThisRunOnly(t *testing.T) {
+	outsideTemp(t)
+	root := fixtureTree(t)
+	req := raptorRequest(t, root)
+	req.across = 0
+	seedRefusals(t, req.denialsPath, "raptor", "raptor-100@1", time.Hour,
+		filepath.Join(root, "lib", "libncurses.6.dylib"))
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{compactLine("mkdir", 4321, "file-write-create",
+			filepath.Join(root, "home", ".local", "share", "raptor", "sessions.d"))}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, req, emit.Styles{})
+	out := joined(b.String())
+	if strings.Contains(out, "--ro "+filepath.Join(root, "lib")) {
+		t.Errorf("--across 0 promised this run only:\n%s", out)
+	}
+	if !strings.Contains(out, "this run only") {
+		t.Errorf("the report should say the union was switched off:\n%s", out)
+	}
+}
+
+func TestExplainRecordsWhatItSaw(t *testing.T) {
+	// The file is the reason the next run's plan can be wider than this one, so
+	// what this run read has to be in it before the report finishes.
+	outsideTemp(t)
+	root := fixtureTree(t)
+	req := raptorRequest(t, root)
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	target := filepath.Join(root, "lib", "libncurses.6.dylib")
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{
+			compactLine("clear", 4321, "file-read-data", target),
+			compactLine("clear", 4321, "file-read-data", target),
+		}, nil
+	}
+	printRunExplain(&strings.Builder{}, req, emit.Styles{})
+	f, err := os.Open(req.denialsPath)
+	if err != nil {
+		t.Fatalf("the run recorded nothing: %v", err)
+	}
+	defer f.Close()
+	rows, skipped := denials.Read(f)
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want a file the reader can trust:\n%v", skipped, rows)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %v, want the one distinct refusal", rows)
+	}
+	got := rows[0]
+	if got.Command != "raptor" || got.Proc != "clear" || got.Target != target || got.Count != 2 {
+		t.Errorf("row = %+v, want raptor's clear refused twice", got)
+	}
+	if got.RunID == "" || !strings.HasPrefix(got.RunID, "raptor-1@") {
+		t.Errorf("RunID = %q, want the run that saw it named so ten runs count as ten", got.RunID)
+	}
+}
+
+func TestExplainWithoutARefusalLogStillPlans(t *testing.T) {
+	// A read-only state directory must not cost the reader the report.
+	outsideTemp(t)
+	root := fixtureTree(t)
+	req := raptorRequest(t, root)
+	req.denialsPath = filepath.Join(t.TempDir(), "missing", "denials.jsonl")
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(time.Time, time.Time) ([]string, error) {
+		return []string{compactLine("clear", 4321, "file-read-data", filepath.Join(root, "lib", "libncurses.6.dylib"))}, nil
+	}
+	var b strings.Builder
+	printRunExplain(&b, req, emit.Styles{})
+	out := joined(b.String())
+	if !strings.Contains(out, "--ro "+filepath.Join(root, "lib")) {
+		t.Errorf("an unwritable log must not lose this run's own grant:\n%s", out)
+	}
+	if !strings.Contains(out, "could not be read") {
+		t.Errorf("the plan should say its evidence came from one run:\n%s", out)
+	}
+}
+
+func TestFormatWindowReadsLikeEnglish(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Duration
+		want string
+	}{{7 * 24 * time.Hour, "7d"}, {90 * time.Minute, "90m"}, {3 * time.Hour, "3h"}, {45 * time.Second, "45s"}} {
+		if got := formatWindow(c.in); got != c.want {
+			t.Errorf("formatWindow(%v) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -445,6 +446,36 @@ func TestRunFlagsForReproducesThePolicy(t *testing.T) {
 	// The convenience endpoints the run actually got are part of the policy too.
 	if claude := strings.Join(runFlagsFor("claude", &runOptions{}, nil, nil), " "); !strings.Contains(claude, "--allow api.anthropic.com") {
 		t.Errorf("a Claude run's endpoint should be in its own reconstruction: %s", claude)
+	}
+}
+
+func TestDenialsLogSitsBesideTheEventLog(t *testing.T) {
+	// The two files are one project's evidence, so they travel together and the
+	// program in the sandbox can reach neither.
+	got := denialsLogFor("/home/daniel/.local/state/sandboxcheckr/projects/ec03b754/events.jsonl")
+	if want := "/home/daniel/.local/state/sandboxcheckr/projects/ec03b754/denials.jsonl"; got != want {
+		t.Errorf("denialsLogFor = %q, want the same directory as the event log", got)
+	}
+	if got := denialsLogFor(""); got != "" {
+		t.Errorf("no event log should mean no refusal log, got %q", got)
+	}
+}
+
+func TestRunFlagsInNamesTheOnesThatMissed(t *testing.T) {
+	// A flag typed after the program reaches the program instead of us, which is
+	// how a bounded probe silently runs the full default. Anything the program
+	// itself defines stays out of the list: we have no idea what it accepts.
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.Var(&multiFlag{}, "ro", "")
+	fs.Duration("timeout", 0, "")
+	fs.Bool("observe", false, "")
+	got := strings.Join(runFlagsIn([]string{"--ro", "/opt/local", "--ro", "/usr/local", "--timeout", "20s",
+		"--verbose", "-v", "build", "--observe=true", "--"}, fs), " ")
+	if got != "--ro --timeout --observe" {
+		t.Errorf("runFlagsIn = %q, want each of our own names once", got)
+	}
+	if out := runFlagsIn([]string{"--prompt", "say hi", "--timeout", "0"}, &flag.FlagSet{}); len(out) != 0 {
+		t.Errorf("an empty flag set must not claim anything: %v", out)
 	}
 }
 

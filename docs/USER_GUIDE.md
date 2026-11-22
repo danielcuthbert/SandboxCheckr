@@ -403,7 +403,10 @@ It runs the program in the sandbox, stops it after two minutes if it has not
 finished (`--timeout`, or `--timeout 0` to wait for it), and prints what the
 kernel refused next to the destinations the proxy decided. On macOS that means
 the unified log for the run's window; the run exits 124 when the deadline ended
-it rather than the program.
+it rather than the program. Our own flags are read before the program name, so
+`run ./bin/raptor --timeout 20s` hands `--timeout` to raptor and the probe waits
+the full two minutes; an argument after the program that spells one of our flags
+gets called out when the run starts.
 
 ```
 ── SANDBOX REFUSALS  codex, kernel log, 08:03:59 to 08:04:06  ────────────
@@ -432,7 +435,6 @@ health:
 ```
 ── SANDBOX REFUSALS  kernel log, all confined, 09:21:42 to 09:21:51  ─────
   count  process  operation          target                                        notes
-      2  clear    file-read-data     /opt/local/lib/libncurses.6.dylib             outside the workdir; add --ro <dir>
       1  bash     file-write-create  /tmp/claude-501                               outside the workdir; add --rw <dir>
       1  node     file-write-create  /Users/daniel/.local/share/raptor/sessions.d  outside the workdir; add --rw <dir>
 
@@ -441,9 +443,12 @@ raptor asked for nothing itself, but the sandbox confines everything it starts a
   under their own names. These are every refusal in the window, so a process confined
   by something else on this machine can appear; act on the paths this program needed.
 
-── NEXT RUN  2 grants, 1 host ────────────────────────────────────────────
+── NEXT RUN  2 grants, 1 host ───────────────────────────────────────────
+  planned from 6 refusals across 2 runs of raptor (--across 7d, --across 0 for this run only)
   The least that covers everything above, as one command:
-  sandboxcheckr run --explain --deny-all --allow api.anthropic.com --ro /opt/local/lib --rw /Users/daniel/.local/share/raptor ./bin/raptor
+  sandboxcheckr run --explain --deny-all --allow api.anthropic.com \
+      --ro /opt/local/lib --rw /Users/daniel/.local/share ./bin/raptor
+  a --rw path has to exist first: mkdir -p /Users/daniel/.local/share/raptor
   1 refusal is in the shared /tmp: the run has a private TMPDIR, and --rw /tmp would open that one.
   1 destination was a canary, a redirector or loopback: those stay refused.
 ```
@@ -455,7 +460,20 @@ program was trying to make; and the destinations come from this run's own lines
 in the event log, filtered by the run's agent label so another agent's run in
 the same log cannot rub off on the recommendation. The flags the run already had
 are reproduced, minus the ones that should not be repeated into a shell history:
-canary tokens and `--pass-env` names stay out.
+canary tokens and `--pass-env` names stay out. The line breaks at the terminal's
+width with a backslash at each break, so the block pastes as it stands, and a
+flag never lands apart from the path it grants.
+
+The line in the sample grants `--ro /opt/local/lib` although no row above names
+it. That is the part that makes the report a specification rather than an
+anecdote. Each `--explain` appends what it saw to the project's refusal log,
+`denials.jsonl` beside the event log, and the next run plans from the union over
+`--across`, a week by default: one run is one sample of what a program touches,
+and a control fitted to a sample over-permits on one run and breaks on the next.
+The line under the heading says where the plan came from, and `--across 0`
+restricts it to the run in front of you. Rows are matched on the program the run
+was started for, so another agent's refusals in the same project stay out of
+your line, and a path only one run reached for still reaches the line.
 
 What it refuses to offer is the point of the section. A unix socket, a listener
 and a terminal ioctl are refused because the profile means to refuse them, so no
@@ -464,6 +482,15 @@ proxy picked out for itself, and recommending `--allow` for them would undo the
 detection. A path inside the workdir is the profile protecting `.git` or `.env`,
 not a missing grant. And `/tmp` stays out of the line because the run already
 has a private `TMPDIR`, while `--rw /tmp` would open the world-writable one.
+
+A confined window also collects the daemons the sandbox happens to hold, and
+those have been refused for as long as the machine has been up: another
+service's temp folder, `/private/var/db/locationd`, `/Library`. None of them
+stopped your program, and a `--rw` for one would have the tool ask for write
+access to the machine on somebody else's behalf, so they are counted in a line
+of their own and left out of the command. Reads can still come from outside your
+home when they name a package manager's prefix, because that is where a dylib a
+program will not start without usually lives.
 
 It reads the macOS unified log across the run's window, so the refusals half is
 macOS only and costs a second or two; on Linux the sandbox refuses with nothing

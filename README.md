@@ -56,10 +56,15 @@ When you do not know what a program needs, `run --explain` finds out: it runs
 the program, stops it after two minutes if it never exits (`--timeout`), and
 prints the refusals the kernel logged next to the destinations the proxy
 decided, ending with the least set of `--allow`, `--ro` and `--rw` flags that
-would have covered them, as one command to paste. Sockets, listeners, terminal
-ioctls, canary hits and `/tmp` are refused on purpose and are not offered. Those
-refusals are logged on macOS and nowhere a normal user can read on Linux, where
-the flag says so and still offers the allow-list the proxy's own log supports.
+would have covered them, as one command to paste. One run is one sample, so each
+report records what it saw in the project's refusal log and plans from the union
+over `--across` (a week by default, `--across 0` for this run alone): the
+specification is the tenth run's view, not the first one's. Sockets, listeners,
+terminal ioctls, canary hits, `/tmp` and another service's own files are refused
+on purpose and are not offered: the plan stays inside your own trees and a
+package manager's prefix. Those refusals are logged on macOS and nowhere a normal
+user can read on Linux, where the flag says so and still offers the allow-list
+the proxy's own log supports.
 
 Observe mode permits ordinary destinations while logging them. It still blocks
 canary trips. You can narrow an allowed HTTP host to methods and paths with

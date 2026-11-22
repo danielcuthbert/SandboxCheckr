@@ -9,13 +9,16 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/danielcuthbert/sandboxcheckr/internal/denials"
 	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/events"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
+	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
 )
 
 // The egress proxy sees destinations. It cannot see the refusals that stop a
@@ -50,7 +53,8 @@ type denial struct {
 // routineDenials are refusals we have watched a real program shrug off. They are
 // counted and hidden rather than dropped, so the number stays in the report.
 // Each entry needs a run behind it: an innocent list without evidence teaches
-// people to stop reading the table.
+// people to stop reading the table. An empty operation matches that target under
+// any operation, for the paths the kernel logs two ways.
 var routineDenials = []struct {
 	op, targetPrefix, why string
 }{
@@ -60,6 +64,12 @@ var routineDenials = []struct {
 	// Same run, 14 reads refused and codex carried on to finish the session.
 	{"user-preference-read", "kcfpreferencesanyapplication", "a preference sweep every program makes"},
 	{"user-preference-read", "com.apple.security", "a preference read about the keychain, not the keychain itself"},
+	// raptor under SandboxCheckr on 2026-11-22: 60 of these from six helper
+	// processes, and the script ran on to the refusal that mattered.
+	{"file-ioctl", "/dev/dtracehelper", "the probe every linked program touches"},
+	// Same window: python asked four times and imported anyway. The empty
+	// operation matches either shape the kernel logs it in.
+	{"", "/dev/autofs_nowait", "the automounter check the C library makes"},
 }
 
 // parseDenialLine turns one unified-log line into a process, an operation and a
@@ -142,7 +152,7 @@ func cleanDenialTarget(s string) string {
 // it is not on the innocent list.
 func routineWhy(op, target string) string {
 	for _, r := range routineDenials {
-		if op == r.op && strings.HasPrefix(target, r.targetPrefix) {
+		if (r.op == "" || op == r.op) && strings.HasPrefix(target, r.targetPrefix) {
 			return r.why
 		}
 	}
@@ -425,8 +435,13 @@ type explainRequest struct {
 	// where the destinations came from: the proxy decided them, not the kernel.
 	eventsPath string
 	agent      string
-	since      time.Time
-	until      time.Time
+	// denialsPath is the project's record of what earlier runs saw refused, and
+	// across how far back into it the plan reaches. One run is one sample; the
+	// union is the specification. Zero across means plan from this run alone.
+	denialsPath string
+	across      time.Duration
+	since       time.Time
+	until       time.Time
 }
 
 // maxPlanGrants bounds the paste line. Past this the program wants the machine,
@@ -442,7 +457,11 @@ type grantPlan struct {
 	notGrantable  int      // sockets, listeners, ioctls: no flag opens these
 	insideWorkdir int      // already writable; the profile protects them on purpose
 	inTemp        int      // /tmp is the run's own scratch, a decision of its own
+	systemSpace   int      // a daemon's own files, which no run of yours should grant
 	overCap       int      // paths left out to keep the line readable
+	// drawnFrom says what the plan was built from, so a union over ten runs is
+	// never mistaken for what this run saw.
+	drawnFrom string
 }
 
 // grantKind says whether an operation is a path the reader can grant at all.
@@ -527,10 +546,46 @@ func inPrivateTemp(target string) bool {
 	return false
 }
 
+// outsideHomePrefixes are the trees beyond your own where a program of yours can
+// legitimately have files: the package managers that install to a fixed prefix,
+// the system's read-only data, and the one firmlink macOS keeps its timezones
+// behind. Nothing else belongs here.
+var outsideHomePrefixes = []string{
+	"/opt/homebrew", "/opt/local", "/nix", "/usr/local", "/usr/share", "/usr/lib", "/etc",
+	"/private/var/db/timezone",
+}
+
+// inUserSpace answers whether a refusal is this run's business at all. A confined
+// window collects every process the sandbox holds, including the daemons that
+// were already being refused before you ran anything: another service's temp
+// folder, /private/var/db/locationd, /Library. Those are not what stopped your
+// program, and offering --rw for them would have the tool ask for write access to
+// the machine on somebody else's behalf. Writes are held to your own trees for
+// the same reason; reads can also come from a package prefix, which is where a
+// dylib the program will not start without usually lives.
+func inUserSpace(target, workdir string, writable bool) bool {
+	if under(target, workdir) {
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil && under(target, home) {
+		return true
+	}
+	if writable {
+		return false
+	}
+	for _, prefix := range outsideHomePrefixes {
+		if under(target, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // planGrants turns refusals into the least set of flags that covers them.
 func planGrants(ds []denial, workdir string) grantPlan {
 	var p grantPlan
 	reads, writes := map[string]bool{}, map[string]bool{}
+	mkdirOf := map[string]string{}
 	for _, d := range ds {
 		kind, ok := grantKind(d.op)
 		if !ok || !strings.HasPrefix(d.target, "/") {
@@ -550,7 +605,11 @@ func planGrants(ds []denial, workdir string) grantPlan {
 			p.inTemp++
 			continue
 		}
-		grant, mkdirOf := grantFor(d.target)
+		if !inUserSpace(d.target, workdir, kind == "rw") {
+			p.systemSpace++
+			continue
+		}
+		grant, mkdir := grantFor(d.target)
 		if grant == "" {
 			p.notGrantable++
 			continue
@@ -560,32 +619,37 @@ func planGrants(ds []denial, workdir string) grantPlan {
 			continue
 		}
 		writes[grant] = true
-		if mkdirOf != "" {
-			p.mkdir = append(p.mkdir, mkdirOf)
+		if mkdir != "" && mkdirOf[grant] == "" {
+			mkdirOf[grant] = mkdir
 		}
 	}
-	p.ro, p.overCap = cappedSorted(reads, p.overCap)
-	var extra int
-	p.rw, extra = cappedSorted(writes, extra)
-	p.overCap += extra
+	// One cap across both lists, taken alternately: eight of each would be a
+	// sixteen flag line, and a program that needs a read and a write should keep
+	// both halves of the answer rather than lose one to whichever sorted last.
+	roAll, rwAll := sortedSet(reads), sortedSet(writes)
+	for readsNext := true; len(p.ro)+len(p.rw) < maxPlanGrants; readsNext = !readsNext {
+		if readsNext {
+			if len(roAll) > 0 {
+				p.ro, roAll = append(p.ro, roAll[0]), roAll[1:]
+				continue
+			}
+		} else if len(rwAll) > 0 {
+			p.rw, rwAll = append(p.rw, rwAll[0]), rwAll[1:]
+			continue
+		}
+		if len(roAll) == 0 && len(rwAll) == 0 {
+			break
+		}
+	}
+	p.overCap = len(roAll) + len(rwAll)
+	for _, grant := range p.rw {
+		if m := mkdirOf[grant]; m != "" {
+			p.mkdir = append(p.mkdir, m)
+		}
+	}
 	slices.Sort(p.mkdir)
 	p.mkdir = slices.Compact(p.mkdir)
 	return p
-}
-
-// cappedSorted sorts a set of paths and keeps the first max, reporting how many
-// did not fit. Sorted rather than first-seen so the line is the same whatever
-// order the kernel logged the refusals in.
-func cappedSorted(set map[string]bool, already int) ([]string, int) {
-	all := make([]string, 0, len(set))
-	for k := range set {
-		all = append(all, k)
-	}
-	slices.Sort(all)
-	if len(all) > maxPlanGrants {
-		return all[:maxPlanGrants], already + len(all) - maxPlanGrants
-	}
-	return all, already
 }
 
 // quoteArg single-quotes what the shell would otherwise expand, the same
@@ -598,6 +662,53 @@ func quoteArg(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// paired glues each flag to the value it took so the two travel as one piece:
+// a line break may fall between options, but never between --ro and the path it
+// grants, which would leave the reader with a flag that reads the next option as
+// its argument. A value never starts with a dash, so that is the test.
+func paired(flags []string) []string {
+	var out []string
+	for i := 0; i < len(flags); i++ {
+		f := flags[i]
+		if strings.HasPrefix(f, "--") && i+1 < len(flags) && !strings.HasPrefix(flags[i+1], "--") {
+			out = append(out, quoteArg(f)+" "+quoteArg(flags[i+1]))
+			i++
+			continue
+		}
+		out = append(out, quoteArg(f))
+	}
+	return out
+}
+
+// wrapCommand breaks an already quoted command between pieces rather than inside
+// one, so a path with a space in it cannot be cut in half. A broken line ends in
+// a backslash and the next opens indented, which is what a shell wants and what
+// makes the whole block pasteable as printed. The lines come back carrying their
+// own place in the report, two columns in, so nothing else has to know the indent.
+func wrapCommand(parts []string, width int) []string {
+	const block, indent = "  ", "      "
+	if width < len(indent)+10 {
+		width = len(indent) + 10
+	}
+	var lines []string
+	cur := block
+	for _, p := range parts {
+		if cur != block {
+			if len(cur)+1+len(p) > width {
+				lines = append(lines, cur+` \`)
+				cur = indent + p
+				continue
+			}
+			cur += " "
+		}
+		cur += p
+	}
+	if cur != block {
+		lines = append(lines, cur)
+	}
+	return lines
 }
 
 // maxPlanHosts bounds the recommended allow-list for the same reason as
@@ -688,6 +799,122 @@ func sortedSet(set map[string]bool) []string {
 	return out
 }
 
+// denialRows turns what this run saw into rows for the project's record.
+// Refusals folded as routine are already out of both sets, so what is kept is
+// what a person would have read; the process name goes with them because the
+// kernel, not the reader, is what attributed them.
+func denialRows(own, others []denial, req explainRequest) []denials.Row {
+	runID := req.agent
+	if runID == "" {
+		runID = req.command
+	}
+	runID += "@" + strconv.FormatInt(req.since.Unix(), 10)
+	var out []denials.Row
+	for _, set := range [][]denial{own, others} {
+		for _, d := range set {
+			out = append(out, denials.Row{Time: req.until, Command: req.command, Agent: req.agent,
+				RunID: runID, Proc: d.proc, Op: d.op, Target: d.target, Count: d.count})
+		}
+	}
+	return out
+}
+
+// planFromRefusals records this run's refusals beside the event log and plans
+// from the union of everything the same program has been refused in the window.
+// A file that cannot be read is said out loud in the plan's own line rather
+// than quietly shrinking the evidence.
+func planFromRefusals(own, others []denial, req explainRequest) grantPlan {
+	thisRun := denialRows(own, others, req)
+	rows := thisRun
+	if req.across > 0 && req.denialsPath != "" {
+		stored, err := appendAndRead(req, thisRun)
+		if err != nil {
+			p := planGrants(fromRows(thisRun), req.workdir)
+			p.drawnFrom = fmt.Sprintf("planned from this run only: the project's refusal log could not be read (%v)", err)
+			return p
+		}
+		rows = stored
+	}
+	p := planGrants(fromRows(rows), req.workdir)
+	if req.across <= 0 {
+		if len(thisRun) > 0 {
+			p.drawnFrom = "planned from this run only (--across 0)"
+		}
+		return p
+	}
+	runs, refusals := denials.Runs(rows), 0
+	for _, r := range rows {
+		refusals += max(r.Count, 1)
+	}
+	if refusals == 0 {
+		return p
+	}
+	p.drawnFrom = fmt.Sprintf("planned from %d refusal%s across %d run%s of %s (--across %s, --across 0 for this run only)",
+		refusals, plural(refusals), runs, plural(runs), req.command, formatWindow(req.across))
+	return p
+}
+
+// appendAndRead writes this run's rows and reads the window back, so the plan
+// sees the earlier runs as well as this one. The append is the point; a read
+// failure is reported because the plan is about to be narrower than the reader
+// thinks.
+func appendAndRead(req explainRequest, thisRun []denials.Row) ([]denials.Row, error) {
+	if len(thisRun) > 0 {
+		f, err := proxy.OpenAppendNoFollow(req.denialsPath, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		err = denials.Write(f, thisRun)
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.Open(req.denialsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	rows, _ := denials.Read(f)
+	return denials.Select(rows, req.command, req.until.Add(-req.across)), nil
+}
+
+// fromRows turns stored refusals back into the shape the planner takes. Distinct
+// targets are what the plan is about, so rows from different processes that name
+// the same operation and path add up rather than repeat.
+func fromRows(rows []denials.Row) []denial {
+	by := map[string]*denial{}
+	order := make([]string, 0, len(rows))
+	for _, r := range rows {
+		key := r.Op + "\x00" + r.Target
+		d, ok := by[key]
+		if !ok {
+			d = &denial{proc: r.Proc, op: r.Op, target: r.Target}
+			by[key] = d
+			order = append(order, key)
+		}
+		d.count += max(r.Count, 1)
+	}
+	out := make([]denial, 0, len(order))
+	for _, k := range order {
+		out = append(out, *by[k])
+	}
+	return out
+}
+
+// formatWindow is a duration a person reads rather than counts.
+func formatWindow(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour && d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", int64(d/24/time.Hour))
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", int64(d/time.Minute))
+	}
+	return d.String()
+}
+
 // capped keeps the first max of a sorted list and carries the count that fell off.
 func capped(all []string, already int) ([]string, int) {
 	if len(all) > maxPlanHosts {
@@ -743,32 +970,38 @@ func formatNextRun(g grantPlan, h hostPlan, req explainRequest, st emit.Styles) 
 		note, noteStyle = "nothing to add", st.Dim
 	}
 	b.WriteString(emit.SectionNote(st, noteStyle, runColumns(), "next run", note))
+	if g.drawnFrom != "" {
+		line(&b, st, "  %s", g.drawnFrom)
+	}
 	if total == 0 {
 		line(&b, st, "  Nothing above is one flag away; what follows says why each refusal is not.")
 	} else {
 		line(&b, st, "  The least that covers everything above, as one command:")
-		cmd := append([]string{"sandboxcheckr", "run", "--explain"}, req.baseFlags...)
+		cmd := []string{"sandboxcheckr", "run", "--explain"}
+		cmd = append(cmd, paired(req.baseFlags)...)
 		for _, host := range allows {
-			cmd = append(cmd, "--allow", host)
+			cmd = append(cmd, "--allow "+quoteArg(host))
 		}
 		for _, port := range h.ports {
-			cmd = append(cmd, "--allow-port", port)
+			cmd = append(cmd, "--allow-port "+quoteArg(port))
 		}
 		for _, host := range h.privHosts {
-			cmd = append(cmd, "--allow-private-host", host)
+			cmd = append(cmd, "--allow-private-host "+quoteArg(host))
 		}
 		for _, p := range ro {
-			cmd = append(cmd, "--ro", p)
+			cmd = append(cmd, "--ro "+quoteArg(p))
 		}
 		for _, p := range rw {
-			cmd = append(cmd, "--rw", p)
+			cmd = append(cmd, "--rw "+quoteArg(p))
 		}
-		cmd = append(cmd, req.argv...)
-		quoted := make([]string, len(cmd))
-		for i, a := range cmd {
-			quoted[i] = quoteArg(a)
+		for _, a := range req.argv {
+			cmd = append(cmd, quoteArg(a))
 		}
-		b.WriteString("  " + st.Bold + strings.Join(quoted, " ") + st.Reset + "\n")
+		// A grant list this long outgrows a terminal, so the line breaks between
+		// pieces: a trailing backslash keeps the block pasteable as it stands.
+		for _, l := range wrapCommand(cmd, runColumns()) {
+			b.WriteString(st.Bold + l + st.Reset + "\n")
+		}
 	}
 	for _, m := range g.mkdir {
 		line(&b, st, "  a --rw path has to exist first: mkdir -p %s", quoteArg(m))
@@ -785,8 +1018,13 @@ func formatNextRun(g grantPlan, h hostPlan, req explainRequest, st emit.Styles) 
 		line(&b, st, "  %d refusal%s %s in the shared /tmp: the run has a private TMPDIR, and --rw /tmp "+
 			"would open that one.", g.inTemp, plural(g.inTemp), isAre(g.inTemp))
 	}
+	if g.systemSpace > 0 {
+		line(&b, st, "  %d refusal%s %s a service's own files: daemons the sandbox holds too were refused "+
+			"before this run started, and a grant would open those paths to your program as well.",
+			g.systemSpace, plural(g.systemSpace), isAre(g.systemSpace))
+	}
 	if g.overCap > 0 {
-		line(&b, st, "  %d further path%s %s in the table above, left out of the line.",
+		line(&b, st, "  %d further path%s %s, left out of the line.",
 			g.overCap, plural(g.overCap), isAre(g.overCap))
 	}
 	if h.refused > 0 {
@@ -864,6 +1102,10 @@ func printRunExplain(w io.Writer, req explainRequest, st emit.Styles) {
 		return
 	}
 	own, hidden, others := aggregateDenials(lines, procName)
+	// Recorded first, then planned from: the file is this run's contribution to
+	// the picture and the plan is drawn from everything the same program has
+	// been refused so far.
+	plan := planFromRefusals(own, others, req)
 	if len(own) == 0 && len(others) > 0 {
 		// The program asked for nothing itself, so the refusals that matter are
 		// the ones logged against something else the sandbox confined. Saying
@@ -875,11 +1117,11 @@ func printRunExplain(w io.Writer, req explainRequest, st emit.Styles) {
 			"  kernel names the process that asked: a shell script is logged as bash, its helpers\n"+
 			"  under their own names. These are every refusal in the window, so a process confined\n"+
 			"  by something else on this machine can appear; act on the paths this program needed.", procName)
-		fmt.Fprint(w, formatNextRun(planGrants(others, req.workdir), destinations, req, st))
+		fmt.Fprint(w, formatNextRun(plan, destinations, req, st))
 		return
 	}
 	fmt.Fprint(w, formatDenials(own, hidden, procName, req.since, req.until, st))
 	if len(own) > 0 || len(destinations.allows)+len(destinations.ports)+len(destinations.privHosts) > 0 {
-		fmt.Fprint(w, formatNextRun(planGrants(own, req.workdir), destinations, req, st))
+		fmt.Fprint(w, formatNextRun(plan, destinations, req, st))
 	}
 }
