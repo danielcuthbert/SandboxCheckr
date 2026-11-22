@@ -690,7 +690,8 @@ func (m *Mechanism) Wrapper(w mechanism.Workdir) (mechanism.Artifact, error) {
 			".husky, .envrc and .pre-commit-config.yaml cannot be written — they hold secrets, or code another program runs " +
 			"later outside the sandbox. Opt out per class with ALLOW_DOTENV=1 or ALLOW_EXEC_CONFIG=1. package.json scripts, " +
 			"Makefiles and the like cannot be protected this way: review the diff before you run them.",
-		"Debug an over-tight profile with: log stream --style compact --predicate 'sender == \"Sandbox\"'",
+		"Debug an over-tight profile with: log stream --style compact --predicate 'sender == \"Sandbox\"', " +
+			"or sandboxcheckr run --explain <command>, which prints the same refusals as a table after the run.",
 	}
 	switch {
 	case m.proxyPort != 0:

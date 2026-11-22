@@ -380,6 +380,34 @@ query string on an allowed `GET`. Rules shrink that channel; they don't close it
 The real fix for the incident's registry was on the registry itself: no
 anonymous writes, no WebDAV, upstreams pinned, per-agent read-only tokens.
 
+**When the program fails before it connects**
+
+The destinations table only shows what reached the proxy. A program the sandbox
+stops on a syscall never gets there, and the run says "no destinations were
+contacted", which is the least useful sentence in the output. `--explain` asks
+the kernel afterwards what it refused from that program:
+
+```sh
+sandboxcheckr run --explain codex --no-daemon
+```
+
+```
+── refused by the sandbox (kernel log, codex, 20:20:11 to 20:23:02) ──
+  operation         target                                            count
+  file-ioctl        /dev/ttys003                                          3  terminal control; this run did not inherit that device
+  network-outbound  …odex/app-server-control/app-server-control.sock      1  unix socket, refused by design
+  1 routine refusal hidden: the VoiceOver check most programs ignore
+```
+
+That is how a missing `--rw`, a program that wants to write inside your home, or
+a terminal it was never given gets found without reading a profile by hand.
+Refusals are grouped by operation and target, counted, most refused first.
+Advice is attached only where the answer is known, and things we have watched
+programs ignore are counted rather than shown, so the table stays worth reading.
+It reads the macOS unified log across the run's window, so it is macOS only and
+costs a second or two; on Linux the sandbox refuses with nothing logged, and
+`--explain` says so instead of printing an empty table that reads as clean.
+
 ### The console: where each agent went
 
 Every proxied run also appends one JSON line per decision to an event log,
@@ -713,6 +741,8 @@ sandboxcheckr run --canary-token abc123.canarytokens.com -- claude   # forward a
 # A sandboxcheckr.toml in the project is the baseline; flags add to or override it.
 # Python venvs (VIRTUAL_ENV, .venv, venv) are granted read-only and put first on PATH.
 # Event logs are per project; console in the same project reads that project's log.
+# If the program fails without reaching the network, --explain prints what the
+# sandbox refused from it (macOS kernel log) after the run.
 # A program that draws in the terminal (a TUI) has to change the terminal's own
 # settings, which the profile grants on the terminal the run is attached to: run
 # it from a terminal rather than with stdin, stdout and stderr all redirected.

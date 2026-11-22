@@ -49,6 +49,7 @@ Examples:
   sandboxcheckr run --workdir ~/code/app -- claude -p "review this code"
   sandboxcheckr run --allow registry.npmjs.org -- npm install
   sandboxcheckr run --observe -- npm test  # discovers hosts; still blocks canary trips
+  sandboxcheckr run --explain codex --no-daemon  # then what the sandbox refused
 
 A sandboxcheckr.toml beside the code removes the flags from every later run:
 
@@ -76,6 +77,12 @@ PATH inside the sandbox, so the interpreter and its packages resolve.
 The event log is per project by default: each project's runs append to a log
 under ~/.local/state/sandboxcheckr/projects/, and "sandboxcheckr console"
 run in the same project reads it back. --events chooses an explicit file.
+
+The proxy's table shows destinations, so a program the sandbox stops before it
+reaches the network shows nothing there. --explain asks the kernel afterwards
+what it refused from that program: the ioctl on the terminal, the write outside
+the workdir, the connect to a unix socket. macOS only, where those refusals are
+logged; on Linux the sandbox says nothing and --explain says so.
 
 FLAGS
 `
@@ -128,6 +135,7 @@ type runOptions struct {
 	allows, rules, ports, privHosts, passes, ro, rw multiFlag
 	canaryTokens                                    multiFlag
 	observe, canaryKill, noCanary, noAgentAuth      bool
+	explain                                         bool
 	events, agent, denyFile                         string
 }
 
@@ -152,6 +160,7 @@ func runSandbox(args []string) int {
 	fs.BoolVar(&o.noCanary, "no-canary", false, "disable canary credentials (the proxy prints this)")
 	fs.Var(&o.canaryTokens, "canary-token", "external canary token `host` (a DNS token from canarytokens.org) or `name=value` to watch a string; repeatable. Lookups of the token host and connections to it are forwarded so the token service alerts, and every use trips at high confidence")
 	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
+	fs.BoolVar(&o.explain, "explain", false, "after the run, report what the sandbox refused from the program (macOS kernel log)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -483,6 +492,10 @@ func runSandbox(args []string) int {
 		env = replaceEnv(env, "BIND_PORTS", strings.Join(bindPorts, ","))
 	}
 
+	// The kernel log is searched over this window, so it starts with the run
+	// rather than with the child: a refusal during the program's own startup is
+	// usually the interesting one.
+	started := time.Now()
 	cmd := exec.Command("/bin/sh", append([]string{filepath.Join(private, art.FileName)}, argv...)...)
 	cmd.Dir, cmd.Env = project, env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -511,6 +524,11 @@ func runSandbox(args []string) int {
 	// If the runner died before its trap stopped the proxy, stop it here so
 	// the exit summary is printed after the child exits on every path.
 	stopOrphanedProxy(private)
+	if o.explain {
+		// Last, so it follows the proxy's own table: destinations first, then
+		// the refusals the proxy could never have seen.
+		printRunExplain(os.Stderr, commandName, started, time.Now())
+	}
 	if err == nil {
 		return 0
 	}

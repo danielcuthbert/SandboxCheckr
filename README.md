@@ -52,6 +52,12 @@ and prints the missing `allow`, `allow-port` and `allow-private-host` lines
 for your review; `--write` puts them in `sandboxcheckr.toml`. It never
 proposes canary hosts, and a denied enforcing run feeds it just as well.
 
+When a program fails without ever reaching the network, `run --explain` asks the
+kernel afterwards what the sandbox refused from it: the ioctl on the terminal,
+the write outside the workdir, the connect to a unix socket. Those refusals are
+logged on macOS and nowhere a normal user can read on Linux, where the flag says
+so rather than printing an empty table.
+
 Observe mode permits ordinary destinations while logging them. It still blocks
 canary trips. You can narrow an allowed HTTP host to methods and paths with
 `--rule`; see the [user guide](docs/USER_GUIDE.md#the-egress-proxy-seatbelt-proxy-bubblewrap-proxy).
