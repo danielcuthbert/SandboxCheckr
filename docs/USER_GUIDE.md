@@ -392,18 +392,23 @@ sandboxcheckr run --explain codex --no-daemon
 ```
 
 ```
-── refused by the sandbox (kernel log, codex, 20:20:11 to 20:23:02) ──
-  operation         target                                            count
-  file-ioctl        /dev/ttys003                                          3  terminal control; this run did not inherit that device
-  network-outbound  …odex/app-server-control/app-server-control.sock      1  unix socket, refused by design
-  1 routine refusal hidden: the VoiceOver check most programs ignore
+── refused by the sandbox (kernel log, codex, 08:03:59 to 08:04:06) ──
+  count  operation         target                                            notes
+       3  file-ioctl        /dev/ttys003                                      terminal control; this run did not inherit that device
+       3  file-read-data    /Users/daniel/.agents/skills                      outside the workdir; add --ro <dir>
+       1  network-bind      local:*:0                                         a listener; only the proxy's own port may bind
+       1  network-outbound  …odex/app-server-control/app-server-control.sock  unix socket, refused by design
+  15 routine refusals hidden: 14 a preference sweep every program makes; 1 the VoiceOver check most programs ignore
 ```
 
 That is how a missing `--rw`, a program that wants to write inside your home, or
 a terminal it was never given gets found without reading a profile by hand.
-Refusals are grouped by operation and target, counted, most refused first.
-Advice is attached only where the answer is known, and things we have watched
-programs ignore are counted rather than shown, so the table stays worth reading.
+Refusals are collapsed to distinct operation and target pairs with the count in
+front, most refused first; a note repeated down a run of rows is stated once;
+the twenty-first row onwards is summarised rather than printed; and the things
+we have watched programs ignore are folded into the last line with their count,
+so nobody has to read past the noise to find the refusal that matters.
+
 It reads the macOS unified log across the run's window, so it is macOS only and
 costs a second or two; on Linux the sandbox refuses with nothing logged, and
 `--explain` says so instead of printing an empty table that reads as clean.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -57,8 +58,8 @@ func TestParseDenialLineRejectsUnsafeNames(t *testing.T) {
 func TestAggregateDenialsCountsAndOrders(t *testing.T) {
 	lines := []string{logWrite, logIoctl, logIoctl, logIoctl, logSock, logPref, logNoise, logAllow}
 	shown, hidden := aggregateDenials(lines, "codex")
-	if hidden != 1 {
-		t.Fatalf("hidden = %d, want 1 (the VoiceOver preference read)", hidden)
+	if len(hidden) != 1 {
+		t.Fatalf("hidden = %v, want one VoiceOver preference read", hidden)
 	}
 	if len(shown) != 3 {
 		t.Fatalf("got %d distinct refusals, want 3: %+v", len(shown), shown)
@@ -78,10 +79,13 @@ func TestFormatDenials(t *testing.T) {
 		{op: "file-ioctl", target: "/dev/ttys003", count: 3},
 		{op: "network-outbound", target: "/Users/daniel/.codex/app-server-control/app-server-control.sock", count: 1},
 	}
-	out := formatDenials(ds, 2, "codex", since, until)
+	// The same reason twice: counted twice, named once.
+	noise := []string{"the VoiceOver check most programs ignore", "the VoiceOver check most programs ignore"}
+	out := formatDenials(ds, noise, "codex", since, until)
 	for _, want := range []string{
 		"refused by the sandbox (kernel log, codex,",
 		"20:20:00 to 20:21:30",
+		"count", "operation", "target", "notes",
 		"file-ioctl", "/dev/ttys003",
 		"terminal control; this run did not inherit that device",
 		"unix socket, refused by design",
@@ -91,14 +95,64 @@ func TestFormatDenials(t *testing.T) {
 			t.Errorf("report missing %q:\n%s", want, out)
 		}
 	}
-	if !strings.Contains(out, "app-server-control.sock") {
-		t.Errorf("the socket target should survive with its tail:\n%s", out)
+	if !strings.HasPrefix(out, "\n") {
+		t.Errorf("the table needs a blank line above it, it follows another block:\n%s", out)
 	}
-	// The count column is a column: same rune offset on both rows, whatever the
-	// width of the operation or the target above and below it.
+	// A column is a column: the same offset in every row, whatever the width of
+	// what sits above it. Measured in columns, so the ellipsis in the truncated
+	// target cannot hide a two-column drift.
 	rows := dataRows(t, out)
-	if a, b := countColumn(rows[0], "3"), countColumn(rows[1], "1"); a < 0 || b < 0 || a != b {
-		t.Errorf("counts not aligned: %d vs %d\n%s", a, b, out)
+	if a, b := columnOffset(rows[0], "file-ioctl"), columnOffset(rows[1], "network-outbound"); a < 0 || a != b {
+		t.Errorf("operation column drifts: %d vs %d\n%s", a, b, out)
+	}
+	if a, b := columnOffset(rows[0], "/dev/ttys003"), columnOffset(rows[1], "…"); a < 0 || a != b {
+		t.Errorf("target column drifts: %d vs %d\n%s", a, b, out)
+	}
+	if strings.Contains(out, " \n") {
+		t.Errorf("rows must not trail blanks:\n%s", out)
+	}
+}
+
+func TestFormatDenialsRepeatsANoteOnce(t *testing.T) {
+	// Eight timezone reads all want the same thing; saying it eight times is
+	// noise that buries the one row nobody has seen before.
+	ds := []denial{
+		{op: "file-read-data", target: "/Users/daniel/.agents/skills", count: 3},
+		{op: "file-read-data", target: "/Users/daniel/.agents/skills/find-skills", count: 3},
+		{op: "file-read-data", target: "/private/var/db/timezone/tz/2026f.1.0/zoneinfo/GMT", count: 2},
+	}
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	if n := strings.Count(out, "outside the workdir; add --ro <dir>"); n != 1 {
+		t.Errorf("the shared note should be stated once, found %d:\n%s", n, out)
+	}
+	if n := strings.Count(out, "file-read-data"); n != 3 {
+		t.Errorf("every row should still name its operation, found %d:\n%s", n, out)
+	}
+}
+
+func TestFormatDenialsKeepsDistinctNotes(t *testing.T) {
+	// The suppression is per note per operation, not a blanket once-per-table.
+	ds := []denial{
+		{op: "file-write-data", target: "/Users/daniel/.npmrc", count: 2},
+		{op: "file-read-data", target: "/Users/daniel/.aws/credentials", count: 1},
+	}
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	if !strings.Contains(out, "--rw") || !strings.Contains(out, "--ro") {
+		t.Errorf("both notes should appear:\n%s", out)
+	}
+}
+
+func TestFormatDenialsCapsTheTable(t *testing.T) {
+	ds := make([]denial, 0, maxExplainRows+5)
+	for i := 0; i < maxExplainRows+5; i++ {
+		ds = append(ds, denial{op: "file-read-data", target: fmt.Sprintf("/Users/daniel/f%d", i), count: maxExplainRows + 5 - i})
+	}
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	if !strings.Contains(out, "and 5 more, least refused first") {
+		t.Errorf("a truncated table should say so:\n%s", out)
+	}
+	if n := len(dataRows(t, out)); n != maxExplainRows {
+		t.Errorf("printed %d rows, want the cap of %d", n, maxExplainRows)
 	}
 }
 
@@ -108,7 +162,8 @@ func dataRows(t *testing.T, out string) []string {
 	var rows []string
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "  ") && !strings.Contains(line, "──") &&
-			!strings.Contains(line, "operation") && !strings.Contains(line, "routine refusal") {
+			!strings.Contains(line, "operation") && !strings.Contains(line, "routine refusal") &&
+			!strings.Contains(line, "more, least refused") {
 			rows = append(rows, line)
 		}
 	}
@@ -118,10 +173,9 @@ func dataRows(t *testing.T, out string) []string {
 	return rows
 }
 
-// countColumn is the rune offset of a count, measured in columns rather than
-// bytes so a multi-byte ellipsis cannot hide a misalignment.
-func countColumn(row, count string) int {
-	i := strings.LastIndex(row, "  "+count)
+// columnOffset is where a string starts, counted in columns rather than bytes.
+func columnOffset(row, s string) int {
+	i := strings.Index(row, s)
 	if i < 0 {
 		return -1
 	}
@@ -129,7 +183,7 @@ func countColumn(row, count string) int {
 }
 
 func TestFormatDenialsNothingRefused(t *testing.T) {
-	out := formatDenials(nil, 0, "codex", time.Now().Add(-time.Minute), time.Now())
+	out := formatDenials(nil, nil, "codex", time.Now().Add(-time.Minute), time.Now())
 	if !strings.Contains(out, "nothing was refused for codex") ||
 		!strings.Contains(out, "the failure is not the sandbox") {
 		t.Errorf("an empty report should say so and point elsewhere:\n%s", out)
@@ -158,6 +212,7 @@ func TestAdviceFor(t *testing.T) {
 		{"file-read-data", "/Users/daniel/.aws/credentials", "--ro"},
 		{"system-socket", "domain:32 type:2 protocol:2", "socket family"},
 		{"network-bind", "/tmp/worker.sock", "unix socket"},
+		{"network-bind", "local:*:0", "listener"},
 		{"process-fork", "", ""},
 		{"file-write-data", "relative/path", ""},
 	}
@@ -168,6 +223,42 @@ func TestAdviceFor(t *testing.T) {
 		}
 		if c.want != "" && !strings.Contains(got, c.want) {
 			t.Errorf("adviceFor(%s, %s) = %q, want it to mention %q", c.op, c.target, got, c.want)
+		}
+	}
+}
+
+func TestSummariseReasonsWeightsByCount(t *testing.T) {
+	got := summariseReasons([]string{"rare noise", "common noise", "common noise", "common noise"})
+	if want := "3 common noise; 1 rare noise"; got != want {
+		t.Errorf("summariseReasons = %q, want %q", got, want)
+	}
+	if got := summariseReasons(nil); got != "" {
+		t.Errorf("no reasons should give no text, got %q", got)
+	}
+}
+
+func TestRoutineDenialsCoverOnlyWhatWasMeasured(t *testing.T) {
+	// Each of these appeared in a codex run on 2026-11-22 that went on to
+	// finish its session with them refused. Anything else stays in the table.
+	quiet := []struct{ op, target string }{
+		{"user-preference-read", "com.apple.universalaccess"},
+		{"user-preference-read", "com.apple.universalaccess.whatever"},
+		{"user-preference-read", "kcfpreferencesanyapplication"},
+		{"user-preference-read", "com.apple.security"},
+	}
+	for _, c := range quiet {
+		if routineWhy(c.op, c.target) == "" {
+			t.Errorf("%s %s should be folded away with a reason", c.op, c.target)
+		}
+	}
+	loud := []struct{ op, target string }{
+		{"user-preference-read", "com.apple.finder"},
+		{"file-read-data", "/Users/daniel/.agents/skills"},
+		{"file-write-data", "/Users/daniel/.npmrc"},
+	}
+	for _, c := range loud {
+		if why := routineWhy(c.op, c.target); why != "" {
+			t.Errorf("%s %s is not routine noise, it was excused as %q", c.op, c.target, why)
 		}
 	}
 }

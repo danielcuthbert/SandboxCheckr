@@ -47,6 +47,9 @@ var routineDenials = []struct {
 	// codex under SandboxCheckr on 2026-11-22: denying this changed nothing,
 	// and the A/B run that found the terminal ioctl died with it refused too.
 	{"user-preference-read", "com.apple.universalaccess", "the VoiceOver check most programs ignore"},
+	// Same run, 14 reads refused and codex carried on to finish the session.
+	{"user-preference-read", "kcfpreferencesanyapplication", "a preference sweep every program makes"},
+	{"user-preference-read", "com.apple.security", "a preference read about the keychain, not the keychain itself"},
 }
 
 // parseDenialLine turns one unified-log line into an operation and a target.
@@ -120,19 +123,21 @@ func cleanDenialTarget(s string) string {
 	return strings.TrimRight(s, " ,.")
 }
 
-// isRoutineDenial reports whether the refusal is on the innocent list.
-func isRoutineDenial(op, target string) bool {
+// routineWhy returns why a refusal is treated as background noise, or "" when
+// it is not on the innocent list.
+func routineWhy(op, target string) string {
 	for _, r := range routineDenials {
 		if op == r.op && strings.HasPrefix(target, r.targetPrefix) {
-			return true
+			return r.why
 		}
 	}
-	return false
+	return ""
 }
 
 // aggregateDenials collapses parsed lines into distinct refusals, counted, most
-// refused first so the thing that stopped the program is at the top.
-func aggregateDenials(lines []string, procName string) (shown []denial, hidden int) {
+// refused first so the thing that stopped the program is at the top. The second
+// result is why each routine refusal was folded away, one entry per line.
+func aggregateDenials(lines []string, procName string) (shown []denial, hidden []string) {
 	counts := map[string]int{}
 	order := []string{}
 	for _, line := range lines {
@@ -140,8 +145,8 @@ func aggregateDenials(lines []string, procName string) (shown []denial, hidden i
 		if !ok {
 			continue
 		}
-		if isRoutineDenial(op, target) {
-			hidden++
+		if why := routineWhy(op, target); why != "" {
+			hidden = append(hidden, why)
 			continue
 		}
 		key := op + "\x00" + target
@@ -158,7 +163,12 @@ func aggregateDenials(lines []string, procName string) (shown []denial, hidden i
 		if shown[i].count != shown[j].count {
 			return shown[i].count > shown[j].count
 		}
-		return shown[i].op < shown[j].op
+		if shown[i].op != shown[j].op {
+			return shown[i].op < shown[j].op
+		}
+		// Same count and operation: order the targets so rows that differ only
+		// in path sit together and read as one block.
+		return shown[i].target < shown[j].target
 	})
 	return shown, hidden
 }
@@ -174,6 +184,8 @@ func adviceFor(op, target string) string {
 		return "unix socket, refused by design"
 	case op == "system-socket":
 		return "socket family the profile refuses"
+	case op == "network-bind":
+		return "a listener; only the proxy's own port may bind"
 	case strings.HasPrefix(op, "file-write") && strings.HasPrefix(target, "/"):
 		return "outside the workdir; add --rw <dir>"
 	case strings.HasPrefix(op, "file-read") && strings.HasPrefix(target, "/"):
@@ -212,52 +224,90 @@ func padLeft(s string, width int) string {
 }
 
 // formatDenials is the report. It matches the shape of the destination table
-// the runner prints, so the two read as one summary: columns wide enough for
-// their longest entry, counts right-aligned, advice last.
-func formatDenials(ds []denial, hidden int, procName string, since, until time.Time) string {
+// the runner prints, so the two read as one summary: a counted column on the
+// left so the rows rank, target and note columns wide enough for their longest
+// entry, and trailing blanks trimmed so nothing ragged reaches the margin.
+func formatDenials(ds []denial, hidden []string, procName string, since, until time.Time) string {
 	const stamp = "15:04:05"
 	var b strings.Builder
-	fmt.Fprintf(&b, "── refused by the sandbox (kernel log, %s, %s to %s) ──\n",
-		procName, since.Local().Format(stamp), until.Local().Format(stamp))
+	b.WriteString("\n── refused by the sandbox (kernel log, " + procName + ", " +
+		since.Local().Format(stamp) + " to " + until.Local().Format(stamp) + ") ──\n")
 	if len(ds) == 0 {
 		b.WriteString("  nothing was refused for " + procName + " in this window.\n")
 		b.WriteString("  So the failure is not the sandbox: look at what the program printed.\n")
 		return b.String()
 	}
-	opW, targetW, countW := displayWidth("operation"), displayWidth("target"), displayWidth("count")
+	dropped := 0
+	if len(ds) > maxExplainRows {
+		dropped = len(ds) - maxExplainRows
+		ds = ds[:maxExplainRows]
+	}
+	// Widths in runes, counted once, so every row lines up without a second pass.
+	countW, opW, targetW := displayWidth("count"), displayWidth("operation"), displayWidth("target")
 	targets := make([]string, len(ds))
 	counts := make([]string, len(ds))
+	notes := make([]string, len(ds))
 	for i, d := range ds {
-		if n := displayWidth(d.op); n > opW {
-			opW = n
-		}
+		counts[i] = fmt.Sprintf("%d", d.count)
+		countW = max(countW, displayWidth(counts[i]))
+		opW = max(opW, displayWidth(d.op))
 		targets[i] = truncTarget(d.target)
 		if targets[i] == "" {
 			targets[i] = "(no target)"
 		}
-		if n := displayWidth(targets[i]); n > targetW {
-			targetW = n
-		}
-		counts[i] = fmt.Sprintf("%d", d.count)
-		if n := displayWidth(counts[i]); n > countW {
-			countW = n
-		}
+		targetW = max(targetW, displayWidth(targets[i]))
+		notes[i] = adviceFor(d.op, d.target)
 	}
 	const gap = "  "
-	b.WriteString("  " + padRight("operation", opW) + gap + padRight("target", targetW) + gap + padLeft("count", countW) + "\n")
-	for i, d := range ds {
-		line := "  " + padRight(d.op, opW) + gap + padRight(targets[i], targetW) + gap + padLeft(counts[i], countW)
-		if why := adviceFor(d.op, d.target); why != "" {
-			line += gap + why
+	writeRow := func(count, op, target, note string) {
+		line := "  " + padLeft(count, countW) + gap + padRight(op, opW) + gap + padRight(target, targetW)
+		if note != "" {
+			line += gap + note
 		}
-		b.WriteString(line + "\n")
+		b.WriteString(strings.TrimRight(line, " ") + "\n")
 	}
-	if hidden > 0 {
-		fmt.Fprintf(&b, "  %d routine refusal%s hidden: %s\n",
-			hidden, plural(hidden), routineDenials[0].why)
+	writeRow("count", "operation", "target", "notes")
+	prevNote := ""
+	for i, d := range ds {
+		// A note repeated under the same operation reads as clutter; once is
+		// enough to say what to do about the whole run of rows.
+		note := notes[i]
+		if i > 0 && note != "" && note == prevNote && d.op == ds[i-1].op {
+			note = ""
+		}
+		prevNote = notes[i]
+		writeRow(counts[i], d.op, targets[i], note)
+	}
+	if dropped > 0 {
+		fmt.Fprintf(&b, "  and %d more, least refused first\n", dropped)
+	}
+	if n := len(hidden); n > 0 {
+		// Say what was folded away and how much of it, so anyone who disagrees
+		// with the innocent list can check the count against it.
+		fmt.Fprintf(&b, "  %d routine refusal%s hidden: %s\n", n, plural(n), summariseReasons(hidden))
 	}
 	return b.String()
 }
+
+// summariseReasons collapses the reasons routine refusals were hidden for into
+// "14 why; 1 why", most frequent first.
+func summariseReasons(reasons []string) string {
+	counts := map[string]int{}
+	for _, r := range reasons {
+		counts[r]++
+	}
+	distinct := unique(reasons)
+	sort.SliceStable(distinct, func(i, j int) bool { return counts[distinct[i]] > counts[distinct[j]] })
+	parts := make([]string, 0, len(distinct))
+	for _, r := range distinct {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[r], r))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// maxExplainRows bounds the table. Past this the tail is rarer than what is
+// already listed, and the summary has outstayed its welcome under the run.
+const maxExplainRows = 20
 
 func plural(n int) string {
 	if n == 1 {
@@ -274,20 +324,24 @@ var queryKernelLog = kernelLogDenials
 // after the child has exited and after the proxy's own summary, so it is the
 // last thing a failed run prints.
 func printRunExplain(w io.Writer, commandName string, since, until time.Time) {
+	// Whatever follows the proxy's own summary needs a line to itself first.
+	note := func(format string, args ...any) {
+		fmt.Fprintf(w, "\nnote: "+format+"\n", args...)
+	}
 	procName := commandName
 	if !safeProcessName.MatchString(procName) {
-		fmt.Fprintf(w, "note: --explain cannot search the kernel log for a process named %q\n", procName)
+		note("cannot search the kernel log for a process named %q; a name has to be a plain executable name", procName)
 		return
 	}
 	lines, err := queryKernelLog(procName, since, until)
 	switch {
 	case errors.Is(err, errExplainUnsupported):
-		fmt.Fprintln(w, "note: --explain reads the macOS kernel log. The Linux sandbox refuses in a")
-		fmt.Fprintln(w, "  namespace and seccomp filter that log nothing, so the program just gets EPERM;")
-		fmt.Fprintln(w, "  the proxy's table above is what this platform can tell you.")
+		note("%s", "--explain reads the macOS kernel log, and the Linux sandbox has none: bubblewrap\n"+
+			"  refuses inside a namespace and a seccomp filter that log nothing, so the program\n"+
+			"  simply gets EPERM. The proxy's table above is what this platform can tell you.")
 		return
 	case err != nil:
-		fmt.Fprintln(w, "note: could not read the kernel log:", err)
+		note("could not read the kernel log: %v", err)
 		return
 	}
 	ds, hidden := aggregateDenials(lines, procName)
