@@ -412,6 +412,10 @@ so nobody has to read past the noise to find the refusal that matters.
 It reads the macOS unified log across the run's window, so it is macOS only and
 costs a second or two; on Linux the sandbox refuses with nothing logged, and
 `--explain` says so instead of printing an empty table that reads as clean.
+Colour follows the same rule as the rest of the tool: on for a terminal, off
+when piped, `--no-color` to force it off. A yellow note names a grant you can
+add; rows the profile refuses on purpose (a unix socket, a listener) are dimmed,
+so what's worth acting on is what stands out.
 
 ### The console: where each agent went
 

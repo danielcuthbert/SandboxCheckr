@@ -3,9 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 )
 
 // Lines as sandboxd writes them to the unified log, taken from a real codex run
@@ -81,7 +84,7 @@ func TestFormatDenials(t *testing.T) {
 	}
 	// The same reason twice: counted twice, named once.
 	noise := []string{"the VoiceOver check most programs ignore", "the VoiceOver check most programs ignore"}
-	out := formatDenials(ds, noise, "codex", since, until)
+	out := formatDenials(ds, noise, "codex", since, until, emit.Styles{})
 	for _, want := range []string{
 		"refused by the sandbox (kernel log, codex,",
 		"20:20:00 to 20:21:30",
@@ -121,7 +124,7 @@ func TestFormatDenialsRepeatsANoteOnce(t *testing.T) {
 		{op: "file-read-data", target: "/Users/daniel/.agents/skills/find-skills", count: 3},
 		{op: "file-read-data", target: "/private/var/db/timezone/tz/2026f.1.0/zoneinfo/GMT", count: 2},
 	}
-	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if n := strings.Count(out, "outside the workdir; add --ro <dir>"); n != 1 {
 		t.Errorf("the shared note should be stated once, found %d:\n%s", n, out)
 	}
@@ -136,7 +139,7 @@ func TestFormatDenialsKeepsDistinctNotes(t *testing.T) {
 		{op: "file-write-data", target: "/Users/daniel/.npmrc", count: 2},
 		{op: "file-read-data", target: "/Users/daniel/.aws/credentials", count: 1},
 	}
-	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if !strings.Contains(out, "--rw") || !strings.Contains(out, "--ro") {
 		t.Errorf("both notes should appear:\n%s", out)
 	}
@@ -147,7 +150,7 @@ func TestFormatDenialsCapsTheTable(t *testing.T) {
 	for i := 0; i < maxExplainRows+5; i++ {
 		ds = append(ds, denial{op: "file-read-data", target: fmt.Sprintf("/Users/daniel/f%d", i), count: maxExplainRows + 5 - i})
 	}
-	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	out := formatDenials(ds, nil, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if !strings.Contains(out, "and 5 more, least refused first") {
 		t.Errorf("a truncated table should say so:\n%s", out)
 	}
@@ -183,7 +186,7 @@ func columnOffset(row, s string) int {
 }
 
 func TestFormatDenialsNothingRefused(t *testing.T) {
-	out := formatDenials(nil, nil, "codex", time.Now().Add(-time.Minute), time.Now())
+	out := formatDenials(nil, nil, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if !strings.Contains(out, "nothing was refused for codex") ||
 		!strings.Contains(out, "the failure is not the sandbox") {
 		t.Errorf("an empty report should say so and point elsewhere:\n%s", out)
@@ -207,22 +210,27 @@ func TestTruncTargetKeepsTheTail(t *testing.T) {
 func TestAdviceFor(t *testing.T) {
 	cases := []struct {
 		op, target, want string
+		level            noteLevel
 	}{
-		{"file-write-data", "/Users/daniel/.npmrc", "--rw"},
-		{"file-read-data", "/Users/daniel/.aws/credentials", "--ro"},
-		{"system-socket", "domain:32 type:2 protocol:2", "socket family"},
-		{"network-bind", "/tmp/worker.sock", "unix socket"},
-		{"network-bind", "local:*:0", "listener"},
-		{"process-fork", "", ""},
-		{"file-write-data", "relative/path", ""},
+		{"file-write-data", "/Users/daniel/.npmrc", "--rw", noteAction},
+		{"file-read-data", "/Users/daniel/.aws/credentials", "--ro", noteAction},
+		{"system-socket", "domain:32 type:2 protocol:2", "socket family", noteExpected},
+		{"network-bind", "/tmp/worker.sock", "unix socket", noteExpected},
+		{"network-bind", "local:*:0", "listener", noteExpected},
+		{"file-ioctl", "/dev/ttys003", "terminal control", notePlain},
+		{"process-fork", "", "", notePlain},
+		{"file-write-data", "relative/path", "", notePlain},
 	}
 	for _, c := range cases {
-		got := adviceFor(c.op, c.target)
+		got, level := adviceFor(c.op, c.target)
 		if c.want == "" && got != "" {
 			t.Errorf("adviceFor(%s, %s) = %q, want no advice", c.op, c.target, got)
 		}
 		if c.want != "" && !strings.Contains(got, c.want) {
 			t.Errorf("adviceFor(%s, %s) = %q, want it to mention %q", c.op, c.target, got, c.want)
+		}
+		if level != c.level {
+			t.Errorf("adviceFor(%s, %s) level = %v, want %v", c.op, c.target, level, c.level)
 		}
 	}
 }
@@ -270,7 +278,7 @@ func TestPrintRunExplainRendersTheQuery(t *testing.T) {
 		return []string{logIoctl, logIoctl, logSocket, logPref, logPref}, nil
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now())
+	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	out := b.String()
 	for _, want := range []string{"file-ioctl", "/dev/ttys003", "app-server-control.sock", "routine refusals hidden"} {
 		if !strings.Contains(out, want) {
@@ -286,13 +294,33 @@ func TestPrintRunExplainWithoutAKernelLog(t *testing.T) {
 		return nil, errExplainUnsupported
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now())
+	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	out := b.String()
 	if !strings.Contains(out, "macOS kernel log") || !strings.Contains(out, "EPERM") {
 		t.Errorf("Linux should say it cannot do this rather than print an empty table:\n%s", out)
 	}
 	if strings.Contains(out, "nothing was refused") {
 		t.Error("an unsupported platform must not report a clean run")
+	}
+}
+
+func TestPrintRunExplainColourClosesEveryLine(t *testing.T) {
+	old := queryKernelLog
+	defer func() { queryKernelLog = old }()
+	queryKernelLog = func(string, time.Time, time.Time) ([]string, error) {
+		return nil, errExplainUnsupported
+	}
+	on := emit.Palette(true)
+	var plain, coloured strings.Builder
+	printRunExplain(&plain, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
+	printRunExplain(&coloured, "codex", time.Now().Add(-time.Minute), time.Now(), on)
+	if got := ansiSequences.ReplaceAllString(coloured.String(), ""); got != plain.String() {
+		t.Errorf("colour changed the note.\nplain:\n%s\ncoloured, stripped:\n%s", plain.String(), got)
+	}
+	for _, line := range strings.Split(coloured.String(), "\n") {
+		if strings.TrimSpace(line) != "" && !strings.Contains(line, on.Reset) {
+			t.Errorf("an unclosed escape leaks colour into the shell: %q", line)
+		}
 	}
 }
 
@@ -303,15 +331,49 @@ func TestPrintRunExplainQueryFailure(t *testing.T) {
 		return nil, errors.New("the log query timed out; try a shorter run")
 	}
 	var b strings.Builder
-	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now())
+	printRunExplain(&b, "codex", time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if out := b.String(); !strings.Contains(out, "could not read the kernel log") {
 		t.Errorf("a failed query should be reported, not swallowed:\n%s", out)
 	}
 }
 
+// ansiSequences matches what colour adds, so a coloured render can be compared
+// with a plain one.
+var ansiSequences = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func TestFormatDenialsColourKeepsTheColumns(t *testing.T) {
+	since := time.Date(2026, 11, 22, 20, 20, 0, 0, time.UTC)
+	until := since.Add(90 * time.Second)
+	ds := []denial{
+		{op: "file-read-data", target: "/Users/daniel/.agents/skills", count: 3},
+		{op: "network-bind", target: "local:*:0", count: 1},
+		{op: "file-ioctl", target: "/dev/ttys003", count: 1},
+	}
+	plain := formatDenials(ds, nil, "codex", since, until, emit.Styles{})
+	on := emit.Palette(true)
+	coloured := formatDenials(ds, nil, "codex", since, until, on)
+	if got := ansiSequences.ReplaceAllString(coloured, ""); got != plain {
+		t.Errorf("colour must not change the layout.\nplain:\n%s\ncoloured, stripped:\n%s", plain, got)
+	}
+	if strings.Contains(plain, "\x1b[") {
+		t.Errorf("with colour off there must be no escapes at all:\n%q", plain)
+	}
+	if !strings.Contains(coloured, on.Yellow+"outside the workdir; add --ro <dir>"+on.Reset) {
+		t.Errorf("a grant you can add should stand out:\n%q", coloured)
+	}
+	for _, line := range strings.Split(coloured, "\n") {
+		if strings.Contains(line, "network-bind") && !strings.HasPrefix(line, "  "+on.Dim) {
+			t.Errorf("a refusal made on purpose should recede: %q", line)
+		}
+	}
+	if empty := formatDenials(nil, nil, "codex", since, until, on); !strings.Contains(empty, on.Green+"  nothing was refused") {
+		t.Errorf("a clean run should read as good news:\n%q", empty)
+	}
+}
+
 func TestPrintRunExplainRejectsAwkwardCommand(t *testing.T) {
 	var b strings.Builder
-	printRunExplain(&b, `co"dex`, time.Now().Add(-time.Minute), time.Now())
+	printRunExplain(&b, `co"dex`, time.Now().Add(-time.Minute), time.Now(), emit.Styles{})
 	if !strings.Contains(b.String(), "cannot search the kernel log") {
 		t.Error("an unsafe command name should be refused before the query")
 	}

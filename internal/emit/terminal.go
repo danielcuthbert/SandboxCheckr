@@ -922,17 +922,33 @@ type colors struct {
 	bold, dim, red, green, yellow, blue, reset string
 }
 
-func palette(on bool) colors {
+// Styles are the ANSI attributes the terminal report uses. Exported so the
+// rest of the tool colours itself the same way instead of inventing escapes:
+// every field is the empty string when colour is off, so callers concatenate
+// without branching.
+type Styles struct {
+	Bold, Dim, Red, Green, Yellow, Cyan, Reset string
+}
+
+// Palette returns the styles, coloured when on is set.
+func Palette(on bool) Styles {
 	if !on {
-		return colors{}
+		return Styles{}
 	}
-	return colors{
-		bold:   "\x1b[1m",
-		dim:    "\x1b[2m",
-		red:    "\x1b[31m",
-		green:  "\x1b[32m",
-		yellow: "\x1b[33m",
-		blue:   "\x1b[36m",
-		reset:  "\x1b[0m",
+	return Styles{
+		Bold:   "\x1b[1m",
+		Dim:    "\x1b[2m",
+		Red:    "\x1b[31m",
+		Green:  "\x1b[32m",
+		Yellow: "\x1b[33m",
+		Cyan:   "\x1b[36m",
+		Reset:  "\x1b[0m",
 	}
+}
+
+// palette is the report's own view of the same codes, so the escape sequences
+// live in one place.
+func palette(on bool) colors {
+	s := Palette(on)
+	return colors{bold: s.Bold, dim: s.Dim, red: s.Red, green: s.Green, yellow: s.Yellow, blue: s.Cyan, reset: s.Reset}
 }

@@ -18,11 +18,13 @@ import (
 	"time"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/canary"
+	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
 	"github.com/danielcuthbert/sandboxcheckr/internal/model"
 	"github.com/danielcuthbert/sandboxcheckr/internal/projconfig"
 	"github.com/danielcuthbert/sandboxcheckr/internal/proxy"
+	"github.com/danielcuthbert/sandboxcheckr/internal/tty"
 )
 
 const runUsage = `sandboxcheckr run — run a command in this project's proxied sandbox
@@ -161,6 +163,7 @@ func runSandbox(args []string) int {
 	fs.Var(&o.canaryTokens, "canary-token", "external canary token `host` (a DNS token from canarytokens.org) or `name=value` to watch a string; repeatable. Lookups of the token host and connections to it are forwarded so the token service alerts, and every use trips at high confidence")
 	fs.BoolVar(&o.noAgentAuth, "no-agent-auth", false, "do not grant known agents their login credentials or state directories")
 	fs.BoolVar(&o.explain, "explain", false, "after the run, report what the sandbox refused from the program (macOS kernel log)")
+	noColor := fs.Bool("no-color", false, "force ANSI colour off in the exit summary (otherwise auto: on for a terminal, off when piped)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -526,8 +529,11 @@ func runSandbox(args []string) int {
 	stopOrphanedProxy(private)
 	if o.explain {
 		// Last, so it follows the proxy's own table: destinations first, then
-		// the refusals the proxy could never have seen.
-		printRunExplain(os.Stderr, commandName, started, time.Now())
+		// the refusals the proxy could never have seen. Colour follows the same
+		// rule as the rest of the tool, decided on stderr because that is where
+		// the summary goes.
+		st := emit.Palette(colorEnabled(*noColor, tty.IsTerminal(os.Stderr), os.Getenv("TERM")))
+		printRunExplain(os.Stderr, commandName, started, time.Now(), st)
 	}
 	if err == nil {
 		return 0

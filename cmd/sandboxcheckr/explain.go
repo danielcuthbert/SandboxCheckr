@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/danielcuthbert/sandboxcheckr/internal/emit"
 )
 
 // The egress proxy sees destinations. It cannot see the refusals that stop a
@@ -173,25 +175,35 @@ func aggregateDenials(lines []string, procName string) (shown []denial, hidden [
 	return shown, hidden
 }
 
+// noteLevel says how a refusal should read: a grant you can add, something the
+// profile refuses on purpose, or something with nothing sensible to say about it.
+type noteLevel int
+
+const (
+	notePlain noteLevel = iota
+	noteAction
+	noteExpected
+)
+
 // adviceFor says something only where the answer is known. A guess in this
 // column costs more than an empty one: the reader cannot tell them apart.
-func adviceFor(op, target string) string {
+func adviceFor(op, target string) (string, noteLevel) {
 	switch {
 	case op == "file-ioctl" && strings.HasPrefix(target, "/dev/"):
-		return "terminal control; this run did not inherit that device"
+		return "terminal control; this run did not inherit that device", notePlain
 	case (op == "network-outbound" || op == "network-bind") &&
 		(strings.HasSuffix(target, ".sock") || strings.HasPrefix(target, "/private/var/run/")):
-		return "unix socket, refused by design"
+		return "unix socket, refused by design", noteExpected
 	case op == "system-socket":
-		return "socket family the profile refuses"
+		return "socket family the profile refuses", noteExpected
 	case op == "network-bind":
-		return "a listener; only the proxy's own port may bind"
+		return "a listener; only the proxy's own port may bind", noteExpected
 	case strings.HasPrefix(op, "file-write") && strings.HasPrefix(target, "/"):
-		return "outside the workdir; add --rw <dir>"
+		return "outside the workdir; add --rw <dir>", noteAction
 	case strings.HasPrefix(op, "file-read") && strings.HasPrefix(target, "/"):
-		return "outside the workdir; add --ro <dir>"
+		return "outside the workdir; add --ro <dir>", noteAction
 	}
-	return ""
+	return "", notePlain
 }
 
 // truncTarget keeps a long path readable by its tail, which is the part that
@@ -226,15 +238,20 @@ func padLeft(s string, width int) string {
 // formatDenials is the report. It matches the shape of the destination table
 // the runner prints, so the two read as one summary: a counted column on the
 // left so the rows rank, target and note columns wide enough for their longest
-// entry, and trailing blanks trimmed so nothing ragged reaches the margin.
-func formatDenials(ds []denial, hidden []string, procName string, since, until time.Time) string {
+// entry, and the last thing on a line never padded, so nothing ragged reaches
+// the margin. Colour goes around whole fields, and widths are measured on the
+// plain text, so escape sequences cannot shift a column.
+func formatDenials(ds []denial, hidden []string, procName string, since, until time.Time, st emit.Styles) string {
 	const stamp = "15:04:05"
+	dim, yellow, green := st.Dim, st.Yellow, st.Green
 	var b strings.Builder
-	b.WriteString("\n── refused by the sandbox (kernel log, " + procName + ", " +
-		since.Local().Format(stamp) + " to " + until.Local().Format(stamp) + ") ──\n")
+	b.WriteString("\n")
+	head := "── refused by the sandbox (kernel log, " + procName + ", " +
+		since.Local().Format(stamp) + " to " + until.Local().Format(stamp) + ") ──"
+	b.WriteString(dim + head + st.Reset + "\n")
 	if len(ds) == 0 {
-		b.WriteString("  nothing was refused for " + procName + " in this window.\n")
-		b.WriteString("  So the failure is not the sandbox: look at what the program printed.\n")
+		b.WriteString(green + "  nothing was refused for " + procName + " in this window." + st.Reset + "\n")
+		b.WriteString(dim + "  So the failure is not the sandbox: look at what the program printed." + st.Reset + "\n")
 		return b.String()
 	}
 	dropped := 0
@@ -242,11 +259,13 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 		dropped = len(ds) - maxExplainRows
 		ds = ds[:maxExplainRows]
 	}
-	// Widths in runes, counted once, so every row lines up without a second pass.
+	// Widths in runes, counted once on the plain text, so every row lines up
+	// without a second pass and colour cannot disturb them.
 	countW, opW, targetW := displayWidth("count"), displayWidth("operation"), displayWidth("target")
 	targets := make([]string, len(ds))
 	counts := make([]string, len(ds))
 	notes := make([]string, len(ds))
+	levels := make([]noteLevel, len(ds))
 	for i, d := range ds {
 		counts[i] = fmt.Sprintf("%d", d.count)
 		countW = max(countW, displayWidth(counts[i]))
@@ -256,17 +275,22 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 			targets[i] = "(no target)"
 		}
 		targetW = max(targetW, displayWidth(targets[i]))
-		notes[i] = adviceFor(d.op, d.target)
+		notes[i], levels[i] = adviceFor(d.op, d.target)
 	}
 	const gap = "  "
-	writeRow := func(count, op, target, note string) {
-		line := "  " + padLeft(count, countW) + gap + padRight(op, opW) + gap + padRight(target, targetW)
-		if note != "" {
-			line += gap + note
+	writeRow := func(rowStyle, count, op, target, note, noteStyle string) {
+		b.WriteString("  " + rowStyle + padLeft(count, countW) + gap + padRight(op, opW) + gap)
+		if note == "" {
+			b.WriteString(target)
+		} else {
+			b.WriteString(padRight(target, targetW) + gap + noteStyle + note)
 		}
-		b.WriteString(strings.TrimRight(line, " ") + "\n")
+		if rowStyle != "" || (note != "" && noteStyle != "") {
+			b.WriteString(st.Reset)
+		}
+		b.WriteString("\n")
 	}
-	writeRow("count", "operation", "target", "notes")
+	writeRow(dim, "count", "operation", "target", "notes", "")
 	prevNote := ""
 	for i, d := range ds {
 		// A note repeated under the same operation reads as clutter; once is
@@ -276,15 +300,25 @@ func formatDenials(ds []denial, hidden []string, procName string, since, until t
 			note = ""
 		}
 		prevNote = notes[i]
-		writeRow(counts[i], d.op, targets[i], note)
+		// Yellow for something a flag can fix, dim for a refusal the profile
+		// makes on purpose, so the rows worth reading stand out without a legend.
+		rowStyle, noteStyle := "", ""
+		switch levels[i] {
+		case noteAction:
+			noteStyle = yellow
+		case noteExpected:
+			rowStyle = dim
+		}
+		writeRow(rowStyle, counts[i], d.op, targets[i], note, noteStyle)
 	}
 	if dropped > 0 {
-		fmt.Fprintf(&b, "  and %d more, least refused first\n", dropped)
+		fmt.Fprintf(&b, "%s  and %d more, least refused first%s\n", dim, dropped, st.Reset)
 	}
 	if n := len(hidden); n > 0 {
 		// Say what was folded away and how much of it, so anyone who disagrees
 		// with the innocent list can check the count against it.
-		fmt.Fprintf(&b, "  %d routine refusal%s hidden: %s\n", n, plural(n), summariseReasons(hidden))
+		fmt.Fprintf(&b, "%s  %d routine refusal%s hidden: %s%s\n",
+			dim, n, plural(n), summariseReasons(hidden), st.Reset)
 	}
 	return b.String()
 }
@@ -323,10 +357,16 @@ var queryKernelLog = kernelLogDenials
 // printRunExplain reports what the sandbox refused during the run. It runs
 // after the child has exited and after the proxy's own summary, so it is the
 // last thing a failed run prints.
-func printRunExplain(w io.Writer, commandName string, since, until time.Time) {
+func printRunExplain(w io.Writer, commandName string, since, until time.Time, st emit.Styles) {
 	// Whatever follows the proxy's own summary needs a line to itself first.
 	note := func(format string, args ...any) {
-		fmt.Fprintf(w, "\nnote: "+format+"\n", args...)
+		fmt.Fprint(w, "\n")
+		// Each line carries its own pair of escapes rather than one span over
+		// the paragraph, so a terminal that resets mid-scroll cannot leak colour
+		// into whatever the shell prints next.
+		for _, line := range strings.Split(fmt.Sprintf(format, args...), "\n") {
+			fmt.Fprintf(w, "%s%s%s\n", st.Dim, line, st.Reset)
+		}
 	}
 	procName := commandName
 	if !safeProcessName.MatchString(procName) {
@@ -345,5 +385,5 @@ func printRunExplain(w io.Writer, commandName string, since, until time.Time) {
 		return
 	}
 	ds, hidden := aggregateDenials(lines, procName)
-	fmt.Fprint(w, formatDenials(ds, hidden, procName, since, until))
+	fmt.Fprint(w, formatDenials(ds, hidden, procName, since, until, st))
 }
