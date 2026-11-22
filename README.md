@@ -41,6 +41,13 @@ whatever the program claimed about its own status; without `--canary-kill` the
 program carries on until it finishes, and with it a high-confidence trip kills
 the process where it stands.
 
+Write a host into `~/.config/sandboxcheckr/deny.txt` (or into the file you chose
+with `--deny-file`) while a run is going and the proxy cuts that host off from
+then on, which is how you stop a run you have just watched reach somewhere you
+did not mean. The exit summary counts bytes sent per host, and where the proxy can
+read the request, on plain HTTP or on a `--rule` host whose TLS it terminates, it
+flags the first request that carries data out.
+
 To see which hosts a command needs, then allow only the ones you choose:
 
 ```sh
@@ -159,6 +166,8 @@ options, console workflow, command reference, and platform status.
 sandboxcheckr run --pass-env API_KEY --rw /path/to/config -- my-agent
 sandboxcheckr run --rule registry.npmjs.org:GET,HEAD --allow registry.npmjs.org -- npm install
 sandboxcheckr console                  # inspect proxy events across runs
+sandboxcheckr console canaries         # which agent tripped a canary, across runs
+sandboxcheckr proxy                    # just the allow-listing egress proxy
 sandboxcheckr lint profile.sb          # static Seatbelt profile audit
 sandboxcheckr --emit seatbelt-proxy --workdir /path/to/project
 ```
@@ -178,10 +187,15 @@ make test
 make cross
 ```
 
-Seatbelt probes have been run on macOS 26.6; the runner scripts have only been
-dry-run there. Linux has unit tests and a CI job that runs bubblewrap end to
-end, but has not been verified on the author's Linux hardware. Windows builds
-and reports host posture, but has no sandbox runner yet. 
+Seatbelt probes have been run on macOS 26.6, and `run` has been used there for
+real, `--explain` included, on a program that died in dyld before it printed
+anything. CI executes the emitted seatbelt runners on macOS runners with
+`sandbox-exec` stubbed out, so the runner's own plumbing is tested there and the
+profile itself is tested by the probes on a real Mac. On Linux, bubblewrap is
+verified on the author's hardware as well as in CI: the sandbox builds, the proxy
+gates it, and canary trips, the `--explain` report and the run deadline have all
+been exercised on an arm64 box. Windows builds and reports host posture, but has
+no sandbox runner yet.
 
 Current limits and
 planned work are in the [user guide](docs/USER_GUIDE.md#status) and

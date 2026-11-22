@@ -933,8 +933,8 @@ result never reads as a pass in CI.
 
 | Platform | Baseline + posture | Sandbox mechanisms | Verified on real hardware |
 |---|---|---|---|
-| macOS | ✓ (incl. TCC) | Seatbelt strict / proxied / practical | macOS 26.6 (probe results); runner scripts dry-run only — please report issues |
-| Linux | ✓ | bubblewrap strict / proxied / practical | **Not yet.** Unit-tested; CI runs an end-to-end job on Ubuntu. Treat results as unverified until that job is green. |
+| macOS | ✓ (incl. TCC) | Seatbelt strict / proxied / practical | macOS 26.6 for the probes, and `run` there in daily use; CI executes the emitted runners on macOS runners with `sandbox-exec` stubbed out, so the runner plumbing is tested there and the profile by the probes on a real Mac |
+| Linux | ✓ | bubblewrap strict / proxied / practical | Ubuntu CI runs the report and an emitted wrapper end to end, and an arm64 box has built the sandbox, gated it through the proxy, and exercised canary trips, `--explain` and the run deadline |
 | Windows | ✓ (BitLocker, Secure Boot, VBS/HVCI, Defender, Controlled Folder Access, Smart App Control, UAC, Windows Sandbox, WSL) | **None yet** — the report says so | Compiles; CI runs the unit tests |
 
 **Not yet built:** an AppContainer / Windows Sandbox mechanism, a seccomp filter
