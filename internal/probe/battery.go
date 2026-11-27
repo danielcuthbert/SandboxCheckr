@@ -754,6 +754,21 @@ func classifyNet(err error) (model.Verdict, string, string) {
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
+		// Winsock returns WSA codes, not syscall's POSIX-compatible errno
+		// values. Keep these Windows-only so an unrelated errno on another
+		// platform cannot be mistaken for evidence of containment.
+		if runtime.GOOS == "windows" {
+			const (
+				wsaAccessDenied    syscall.Errno = 10013
+				wsaNetUnreachable  syscall.Errno = 10051
+				wsaConnRefused     syscall.Errno = 10061
+				wsaHostUnreachable syscall.Errno = 10065
+			)
+			switch errno {
+			case wsaAccessDenied, wsaNetUnreachable, wsaConnRefused, wsaHostUnreachable:
+				return model.VerdictBlocked, errno.Error(), "the connection was actively refused"
+			}
+		}
 		switch errno {
 		case syscall.EPERM, syscall.EACCES, syscall.ECONNREFUSED, syscall.ENETUNREACH, syscall.EHOSTUNREACH:
 			return model.VerdictBlocked, errno.Error(), "the connection was actively refused"

@@ -3,6 +3,7 @@ package mechanism
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 )
@@ -50,6 +51,9 @@ func TestProtectedInWorkdirFindsWhatExists(t *testing.T) {
 // came back with nothing to protect and the sandbox launched with .env
 // readable and git hooks writable, with no warning anywhere.
 func TestProtectedInWorkdirReportsAnUnreadableWorkdir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod does not enforce Unix permission bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root reads a directory it has no permission for anyway")
 	}
@@ -78,6 +82,9 @@ func TestProtectedInWorkdirReportsAnUnreadableWorkdir(t *testing.T) {
 // subdirectory is unreadable still has its readable half protected, but the
 // caller has to be told the picture is incomplete.
 func TestProtectedInWorkdirKeepsWhatItFoundBeforeAnError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod does not enforce Unix permission bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root reads a directory it has no permission for anyway")
 	}

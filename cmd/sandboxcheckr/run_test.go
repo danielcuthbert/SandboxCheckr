@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanism"
 	"github.com/danielcuthbert/sandboxcheckr/internal/mechanisms"
@@ -400,26 +402,49 @@ func TestRunDeadlineStopsAProgramThatNeverExits(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process groups and signals are unix; the deadline kills the runner alone elsewhere")
 	}
+	// The runner re-execs its own binary for canary/proxy helpers. Calling
+	// runSandbox from a test binary would recursively run the test suite.
+	bin := filepath.Join(t.TempDir(), "sandboxcheckr")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, out)
+	}
 	project := t.TempDir()
-	// 121 rather than 120 so a leftover from an earlier run of this test cannot
-	// be confused with this one's.
-	marker := "sleep 121"
-	code := runSandbox([]string{"--workdir", project, "--timeout", "1s", "/bin/sh", "-c", marker + " & " + marker})
-	if code != 124 {
-		// Distinguish a machine with no working sandbox from a deadline that
-		// does not fire: the same command, allowed to finish.
-		if plain := runSandbox([]string{"--workdir", project, "/bin/sh", "-c", "exit 0"}); plain != 0 {
-			t.Skipf("no working sandbox here (a plain run exited %d), so the deadline cannot be judged", plain)
+	run := func(args ...string) (int, string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, bin, append([]string{"run", "--workdir", project}, args...)...).CombinedOutput()
+		if ctx.Err() != nil {
+			t.Fatalf("CLI did not finish: %v\n%s", ctx.Err(), out)
 		}
-		t.Fatalf("exit status = %d, want timeout(1)'s 124 for a stopped run", code)
+		if err == nil {
+			return 0, string(out)
+		}
+		if exit, ok := err.(*exec.ExitError); ok {
+			return exit.ExitCode(), string(out)
+		}
+		t.Fatalf("run CLI: %v\n%s", err, out)
+		return -1, string(out)
+	}
+	if code, out := run("/bin/sh", "-c", "exit 0"); code != 0 {
+		t.Skipf("no working sandbox here (exit %d): %s", code, out)
+	}
+	// Each test process gets its own marker, avoiding other concurrent runs.
+	marker := "sleep " + strconv.Itoa(120+os.Getpid())
+	code, out := run("--timeout", "3s", "/bin/sh", "-c", marker+" & touch started; "+marker)
+	if code != 124 {
+		t.Fatalf("exit status = %d, want timeout(1)'s 124 for a stopped run\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(project, "started")); err != nil {
+		t.Fatalf("deadline fired before the sandboxed program started: %v\n%s", err, out)
 	}
 	pgrep, err := exec.LookPath("pgrep")
 	if err != nil {
 		return // nothing to check with; the exit status is the only evidence
 	}
-	out, err := exec.Command(pgrep, "-f", marker).Output()
-	if err == nil && strings.TrimSpace(string(out)) != "" {
-		t.Errorf("the deadline stopped the program but left its tree running: %s", strings.TrimSpace(string(out)))
+	output, err := exec.Command(pgrep, "-f", "^"+marker+"$").Output()
+	if err == nil && strings.TrimSpace(string(output)) != "" {
+		t.Errorf("the deadline stopped the program but left its tree running: %s", strings.TrimSpace(string(output)))
 	}
 }
 
@@ -452,8 +477,9 @@ func TestRunFlagsForReproducesThePolicy(t *testing.T) {
 func TestDenialsLogSitsBesideTheEventLog(t *testing.T) {
 	// The two files are one project's evidence, so they travel together and the
 	// program in the sandbox can reach neither.
-	got := denialsLogFor("/home/daniel/.local/state/sandboxcheckr/projects/ec03b754/events.jsonl")
-	if want := "/home/daniel/.local/state/sandboxcheckr/projects/ec03b754/denials.jsonl"; got != want {
+	dir := t.TempDir()
+	got := denialsLogFor(filepath.Join(dir, "events.jsonl"))
+	if want := filepath.Join(dir, "denials.jsonl"); got != want {
 		t.Errorf("denialsLogFor = %q, want the same directory as the event log", got)
 	}
 	if got := denialsLogFor(""); got != "" {

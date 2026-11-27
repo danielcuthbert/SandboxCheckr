@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -430,8 +431,9 @@ func TestPrintRunExplainColourClosesEveryLine(t *testing.T) {
 	}
 	on := emit.Palette(true)
 	var plain, coloured strings.Builder
-	printRunExplain(&plain, newReq(), emit.Styles{})
-	printRunExplain(&coloured, newReq(), on)
+	req := newReq()
+	printRunExplain(&plain, req, emit.Styles{})
+	printRunExplain(&coloured, req, on)
 	if got := ansiSequences.ReplaceAllString(coloured.String(), ""); got != plain.String() {
 		t.Errorf("colour changed the report.\nplain:\n%s\ncoloured, stripped:\n%s", plain.String(), got)
 	}
@@ -511,6 +513,9 @@ func TestPrintRunExplainRejectsAwkwardCommand(t *testing.T) {
 // would otherwise be counted as scratch rather than as a path to grant.
 func outsideTemp(t *testing.T) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("macOS kernel refusal plans require Unix filesystem paths")
+	}
 	old := privateTempDirs
 	privateTempDirs = []string{filepath.Join(string(filepath.Separator), "sandboxcheckr-test-tmp")}
 	t.Cleanup(func() { privateTempDirs = old })

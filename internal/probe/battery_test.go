@@ -37,6 +37,26 @@ func TestClassifyNilIsAllowed(t *testing.T) {
 	}
 }
 
+func TestClassifyWinsockRefusals(t *testing.T) {
+	for _, code := range []syscall.Errno{10013, 10051, 10061, 10065} {
+		err := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", code)}
+		want := model.VerdictErrored
+		if runtime.GOOS == "windows" {
+			want = model.VerdictBlocked
+		}
+		if got, _, _ := classifyNet(err); got != want {
+			t.Errorf("Winsock code %d: got %s, want %s", code, got, want)
+		}
+	}
+	// A Winsock timeout or unrelated failure still cannot prove containment.
+	for _, code := range []syscall.Errno{10060, 10022} {
+		err := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", code)}
+		if got, _, _ := classifyNet(err); got != model.VerdictErrored {
+			t.Errorf("Winsock code %d: got %s, want ERRORED", code, got)
+		}
+	}
+}
+
 // The central honesty property for network probes: a timeout is ambiguous
 // between a sandbox blackholing traffic and a network being unreachable, so it
 // must not be counted as containment. Otherwise SandboxCheckr would report a
@@ -241,6 +261,9 @@ func openTree(t *testing.T, root string) {
 // (a missing parent directory) is not the sandbox refusing persistence, and
 // BLOCKED is worth too much to be won by a single coincidence.
 func TestPersistencePartialRefusalIsNotBlocked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod does not enforce Unix permission bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root is not refused by file permissions")
 	}
@@ -279,6 +302,9 @@ func TestPersistencePartialRefusalIsNotBlocked(t *testing.T) {
 // When every attempt is refused, that IS the finding, and the probe must say
 // so rather than hedge.
 func TestPersistenceUnanimousRefusalIsBlocked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod does not enforce Unix permission bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root is not refused by file permissions")
 	}
@@ -308,33 +334,29 @@ func TestPersistenceUnanimousRefusalIsBlocked(t *testing.T) {
 // present and modifiable", reporting a persistence write the sandbox never
 // permitted. Its own marker is what makes them recognisable as the probe's.
 func TestPersistenceClearsOnlyItsOwnLeftovers(t *testing.T) {
-	h := t.TempDir()
-	own, foreign := ".config/systemd/user/sandboxcheckr-probe.service", ".config/autostart/sandboxcheckr-probe.desktop"
-	if runtime.GOOS == "darwin" {
-		own, foreign = "Library/LaunchAgents/sandboxcheckr-probe.plist", ".zshrc"
+	paths := persistencePaths[runtime.GOOS]
+	if len(paths) == 0 {
+		t.Skip("no persistence paths defined for this OS")
 	}
-	ownPath := filepath.Join(h, own)
-	if err := os.MkdirAll(filepath.Dir(ownPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(ownPath, []byte(probeMarker), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	foreignPath := filepath.Join(h, foreign)
-	if err := os.MkdirAll(filepath.Dir(foreignPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(foreignPath, []byte("a unit someone else installed"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	probePersistence(home{path: h})
-
-	if _, err := os.Lstat(ownPath); err == nil {
-		t.Error("the probe left its own leftover behind to be mistaken for a persistence write")
-	}
-	if b, err := os.ReadFile(foreignPath); err != nil || string(b) != "a unit someone else installed" {
-		t.Errorf("the probe touched a file that is not its own: %q, %v", b, err)
+	for _, content := range []string{probeMarker, "a unit someone else installed"} {
+		t.Run(content, func(t *testing.T) {
+			h := t.TempDir()
+			p := filepath.Join(h, paths[0])
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			probePersistence(home{path: h})
+			if content == probeMarker {
+				if _, err := os.Lstat(p); !os.IsNotExist(err) {
+					t.Errorf("the probe did not remove its own leftover: %v", err)
+				}
+			} else if b, err := os.ReadFile(p); err != nil || string(b) != content {
+				t.Errorf("the probe touched a file that is not its own: %q, %v", b, err)
+			}
+		})
 	}
 }
 

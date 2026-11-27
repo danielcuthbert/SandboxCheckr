@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -149,6 +150,9 @@ func TestFileContentAbsentIsInconclusive(t *testing.T) {
 // A file that is there and could not be read IS an answer about the channel:
 // something between the two peers closed it.
 func TestFileContentUnreadableIsIsolation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod does not enforce Unix permission bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root is not refused by file permissions")
 	}
